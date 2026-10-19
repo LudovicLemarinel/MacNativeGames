@@ -2136,7 +2136,10 @@ static int uncapped_now(void) { int m = pacing_mfx(); return g_uncapped && (m ==
    30 fps instead of by the display link (3 refreshes would be 33 fps); the display link still shows each picture at a refresh. */
 /* For the FPS overlay: key 2's mode, and the mode the pacing follows and whether it is uncapped right now. */
 int dm_pacing_overlay(int *paced, int *uncapped) { *paced = pacing_mfx(); *uncapped = uncapped_now(); return mfx_enabled(); }
-static int mfx_own_clock(void) { return pacing_mfx() == MFX_30 && (g_paced_hz <= 0 || g_paced_hz % 30); }
+/* 30+30 by our own clock where the refresh rate is not a multiple of 30, and always for a game with the host's real-time
+   step (BOTW): counted in display ticks, ProMotion's lowered refresh (menus, still pictures) made its frames late
+   (19 FPS, then 25 with the wait bounded; 2026-10-19). */
+static int mfx_own_clock(void) { return pacing_mfx() == MFX_30 && (g_paced_hz <= 0 || g_paced_hz % 30 || runtime_frame_step_realtime() > 0); }
 /* Opt-in until live scene/clock validation. Only applies to the existing Mac
    real-time uncapped path; original timing, MetalFX and deterministic tests
    retain the guest interval. GPU/texture lifetime waits are unchanged. */
@@ -2553,7 +2556,7 @@ void dm_nvn_probe_present_interval(void) {
     const int rates[] = {60, 100, 120, 144}; const unsigned ticks30[] = {2, 3, 4, 5};
     for (int r = 0; r < 4; r++) for (int uncapped = 0; uncapped < 2; uncapped++) {
         win_t w = {.interval = 1}; g_paced_hz = rates[r]; g_hz = uncapped ? UNCAPPED_HZ : rates[r]; g_display_mode = 0; g_uncapped = uncapped;
-        if (present_period(&w) != 1000000000ull / 30 || present_ticks(&w) != ticks30[r] || uncapped_now() || mfx_own_clock() != (rates[r] % 30 != 0))
+        if (present_period(&w) != 1000000000ull / 30 || present_ticks(&w) != ticks30[r] || uncapped_now() || mfx_own_clock() != (rates[r] % 30 != 0 || runtime_frame_step_realtime() > 0))
             die("present interval probe: 30+30 must pace exactly 30 fps (display ticks at 60 / 120 Hz, our own clock at 100 / 144 Hz)");
         checked++;
     }
