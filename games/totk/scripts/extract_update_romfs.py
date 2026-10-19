@@ -28,7 +28,7 @@ def copy_range(source, offset, size, target):
             size -= len(data)
 
 
-def merge(base, update, keys_path, hactool, output, *, base_romfs=None):
+def merge(base, update, keys_path, hactool, output, *, base_romfs=None, title_id='0100F2C0115B6000'):
     require(not output.exists(), 'Output exists')
     keys = load_keys(keys_path)
     inputs = []
@@ -42,7 +42,7 @@ def merge(base, update, keys_path, hactool, output, *, base_romfs=None):
             for rights, key in found.items():
                 require(rights not in tickets or tickets[rights] == key, 'Conflicting common tickets')
                 tickets[rights] = key
-            record, header = program_nca(nca_inventory(f, entries, keys), update=is_update)
+            record, header = program_nca(nca_inventory(f, entries, keys), update=is_update, title_id=title_id)
             rights = header[0x230:0x240]
             require(rights == bytes(16) or rights in tickets, 'Missing common ticket')
             inputs.append((source, record, header))
@@ -79,7 +79,7 @@ def merge(base, update, keys_path, hactool, output, *, base_romfs=None):
         log = (result/'merge.log').read_text()
         if code or re.search(r'\(FAIL\)|\(INVALID\)|Failed to|Error:', log):
             (output.parent/(output.name+'-failure.log')).write_text(log)
-        require(code == 0 and not re.search(r'\(FAIL\)|\(INVALID\)|Failed to|Error:', log), 'BKTR verification failed')
+        require(code == 0 and not re.search(r'\(FAIL\)|\(INVALID\)|Failed to|Error:', log), 'BKTR verification failed; a damaged base or update dump also fails here (see the -failure.log next to the output)')
         require(all(re.search(rf'Level {i} \(GOOD\)', log) for i in range(6)), 'Missing verified IVFC levels')
         image = result/'romfs.bin'
         with image.open('rb') as f:
@@ -100,5 +100,7 @@ if __name__ == '__main__':
     parser.add_argument('--hactool', required=True, type=Path)
     parser.add_argument('--base-romfs', type=Path, help='full decrypted base IVFC section, including hash levels (not a raw RomFS image)')
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--title-id', default='0100F2C0115B6000', type=str.upper,
+                        help='base Program title ID (default: Tears of the Kingdom)')
     args = parser.parse_args()
-    merge(args.base, args.update, args.keys, args.hactool, args.output, base_romfs=args.base_romfs)
+    merge(args.base, args.update, args.keys, args.hactool, args.output, base_romfs=args.base_romfs, title_id=args.title_id)

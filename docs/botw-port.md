@@ -1,7 +1,25 @@
 # Breath of the Wild: port preparation
 
-Status: **preparation only**. The BOTW 1.9.0 code modules are extracted, rewritten for Apple silicon and verified
-site by site. There is no BOTW runtime, app build, RomFS, graphics or gameplay support yet.
+Status: **preparation only**. `build_app.py --game botw` extracts, rewrites and verifies the BOTW 1.9.0 code and
+merges and verifies its RomFS, then stops. There is no BOTW runtime, app, graphics or gameplay support yet.
+
+```sh
+python3.14 build_app.py --game botw "<BOTW base 1.0.0>.nsp" --update "<BOTW 1.9.0 update>.nsp" \
+    -k <prod.keys> --firmware <unpacked firmware NCA directory>
+```
+
+**The merged RomFS hash is not recorded yet.** The first base NSP examined (2026-10-19) is damaged: its Program NCA
+`861707001401bbce36c7e421efac76d4` hashes to `636e0d6f…` instead of its content ID, and hactool's IVFC check of the
+base NCA alone fails at 12 blocks of level 5 (RomFS offsets `0xfe7c0000`–`0xfe7d4000`, `0x202288000`–`0x20229c000`,
+`0x202474000`–`0x20247c000`). The merge with 1.9.0 fails at exactly those blocks, all read from base-sourced BKTR
+relocations, so the BKTR path itself is not in question. The base ExeFS passed its own hash table, and the update's
+NCAs all match their content IDs. Until a sound base dump is merged, the build accepts a merge on its six verified IVFC
+levels and prints the SHA-256 to record in `expected-v1.9.0.json`.
+
+The work folder defaults to `BOTW_build` next to the base game. The base game's ExeFS is checked against its known
+hashes but not rewritten; base + 1.9.0 are merged through BKTR (the pinned hactool path used for TOTK updates), all six
+IVFC levels are verified and the image must match the recorded SHA-256; the runtime RomFS index is then prepared. The
+TOTK RomFS overlays, shader seed, game binary and app steps are skipped.
 
 ## Inputs examined
 
@@ -78,17 +96,15 @@ The equivalence run took a few minutes on an M4 with 6 jobs. The DLC pack was no
 
 ## Next steps
 
-1. **Game selection in the build.** `build_app.py`, the Makefile, `fs_host.c`, `services.c` and
-   `extract_app_icon.py` hard-code TOTK's title ID, names and paths (`TOTK_*` environment variables, the
-   `MacNativeGames/TOTK` profile folder). Either factor a game descriptor out of them, or let `games/botw` reuse
-   `games/totk`'s runtime with a `BOTW_GAME_V190` profile in `game_version.h`.
-2. **RomFS.** Merge base + 1.9.0 through the existing BKTR path (`prepare_update_container`, pinned hactool) and record
-   the merged size and SHA-256 in the manifest.
-3. **First boot.** Load the three rewritten modules; leave out every TOTK-specific `GAME_ADDR` patch (the 60 FPS
+1. ~~Game selection in the build~~ (`--game`, done for the code and data steps) and ~~RomFS~~ (done). The runtime side
+   still hard-codes TOTK: the Makefile, `fs_host.c`, `services.c` and `extract_app_icon.py` use its title ID, names
+   and paths (`TOTK_*` environment variables, the `MacNativeGames/TOTK` profile folder). Proposed: let `games/botw`
+   reuse `games/totk`'s runtime with a `BOTW_GAME_V190` profile in `game_version.h` and a `runtime-v190` target.
+2. **First boot.** Load the three rewritten modules; leave out every TOTK-specific `GAME_ADDR` patch (the 60 FPS
    controller, output resolution, crash filter at `0x15ecb0c`, startup checkpoint, swkbd PLT/GOT, world survey).
    Follow the logs to the first NVN frames.
-4. **BOTW-specific patches**, to be found again in BOTW's main: frame pacing and the 30 FPS cap, output resolution,
+3. **BOTW-specific patches**, to be found again in BOTW's main: frame pacing and the 30 FPS cap, output resolution,
    the software keyboard entry (horse naming). The zeldaret/botw decompilation (Switch 1.5.0) can help locate functions,
    but its addresses do not apply to 1.9.0.
-5. **Shaders and data.** Startup shader seeding from BOTW's `.sbfres` / shader archives; any heap or RomFS overlays the
+4. **Shaders and data.** Startup shader seeding from BOTW's `.sbfres` / shader archives; any heap or RomFS overlays the
    higher output resolution needs.

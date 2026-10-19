@@ -5,6 +5,7 @@
 
 Supported: TOTK base 1.0.0 (0100F2C0115B6000), XCI or NSP; optional --update with a supported cumulative update.
 NSPs need common tickets (unless rights-free) and a separate shared-font source. No iPhone/iOS builds are supported.
+In preparation: --game botw with BOTW base 1.0.0 and --update 1.9.0 stops after the verified code and data (no app yet).
 Nothing from the game is in this repository; everything is made from your files on your Mac. Key values are never printed.
 
 Steps (each one checked against games/totk/assets/expected-v<version>.json, so a damaged dump or another version stops the
@@ -34,7 +35,17 @@ GAME = REPO / 'games/totk'
 EXPECTED = json.loads((GAME / 'assets/expected-v1.0.0.json').read_text())
 UPDATED = json.loads((GAME / 'assets/expected-v1.1.2.json').read_text())
 UPDATED143 = json.loads((GAME / 'assets/expected-v1.4.3.json').read_text())
-VERSIONS = {'v0': EXPECTED, 'v112': UPDATED, 'v143': UPDATED143}
+BOTW190 = json.loads((REPO / 'games/botw/assets/expected-v1.9.0.json').read_text())
+VERSIONS = {'v0': EXPECTED, 'v112': UPDATED, 'v143': UPDATED143, 'v190': BOTW190}
+# --game: TOTK builds the app; BOTW (in preparation, docs/botw-port.md) has no runtime yet, so its build stops after
+# the verified code and data. BOTW's 1.0.0 code is not a target: its base game only supplies the RomFS under 1.9.0.
+GAMES = {
+    'totk': dict(name='Tears of the Kingdom', title_id='0100F2C0115B6000', updates=('v112', 'v143'), work='TOTK_build',
+                 base_code=True, runtime=True),
+    'botw': dict(name='Breath of the Wild', title_id='01007EF00011E000', updates=('v190',), work='BOTW_build',
+                 base_code=False, runtime=False),
+}
+SELECTED = GAMES['totk']
 HACTOOL = ('https://github.com/SciresM/hactool.git', '1d64a83450e025622f3468c28fc4164dad2c5ef6')
 APP_NAME = 'Tears of the Kingdom'
 BUNDLE_ID = 'org.macnativegames.totk'
@@ -91,7 +102,11 @@ def sha256(path):
 def check(what, got, want):
     if got != want:
         raise BuildError(f'{what}: SHA-256 {got[:16]}... is not the expected {want[:16]}... '
-                         f'(is this Tears of the Kingdom 1.0.0, and the dump complete?)')
+                         f'(is this {SELECTED["name"]} 1.0.0, and the dump complete?)')
+
+
+def title_args():
+    return ['--title-id', SELECTED['title_id']]
 
 
 # ---- prerequisites ----
@@ -220,7 +235,7 @@ def prepare_update_container(tree, game, keys, logs):
 def identify_update(tree, game, keys, logs):
     """Choose the runtime by verified module bytes, never by the package filename."""
     source = prepare_update_container(tree, game, keys, logs)
-    for version in ('v112', 'v143'):
+    for version in SELECTED['updates']:
         exefs = tree / f'extracted/{version}/exefs'
         if source_matches(exefs.parent / 'extraction-manifest.json', source) and all(
                 (exefs / name).is_file() and sha256(exefs / name) == digest
@@ -228,13 +243,14 @@ def identify_update(tree, game, keys, logs):
             return version, source
     staging = tree / 'extracted/update-detection'
     if staging.exists(): shutil.rmtree(staging)
-    run([tree / '.venv/bin/python', 'scripts/extract_exefs.py', source, '--keys', keys,
+    run([tree / '.venv/bin/python', 'scripts/extract_exefs.py', source, '--keys', keys, *title_args(),
          '--update', '--output', staging / 'exefs'], logs / 'identify-update.log', cwd=tree)
     actual = {path.name: sha256(path) for path in (staging / 'exefs').iterdir()}
-    version = next((version for version in ('v112', 'v143')
+    version = next((version for version in SELECTED['updates']
                     if actual == VERSIONS[version]['exefs_sha256']), None)
     if version is None:
-        raise BuildError('unsupported update module hashes; expected 1.1.2 or 1.4.3 (the file name is not used to choose a version)')
+        supported = ' or '.join(VERSIONS[v]['display_version'] for v in SELECTED['updates'])
+        raise BuildError(f'unsupported update module hashes; expected {supported} (the file name is not used to choose a version)')
     target = tree / f'extracted/{version}'
     target.mkdir(parents=True, exist_ok=True)
     if (target / 'exefs').exists(): shutil.rmtree(target / 'exefs')
@@ -291,7 +307,7 @@ def step_code(tree, game, keys, env, logs, *, version="v0"):
         if exefs.exists():
             shutil.rmtree(exefs)
         source = prepare_update_container(tree, game, keys, logs) if update_args else game
-        run([py, 'scripts/extract_exefs.py', source, '--keys', keys, '--output', exefs, *update_args], logs / f'extract_exefs-{version}.log', cwd=tree)
+        run([py, 'scripts/extract_exefs.py', source, '--keys', keys, *title_args(), '--output', exefs, *update_args], logs / f'extract_exefs-{version}.log', cwd=tree)
     for n, h in want.items():
         if not (exefs / n).is_file():
             raise BuildError(f'ExeFS {n} is missing; not the supported version')
@@ -318,13 +334,31 @@ def step_code(tree, game, keys, env, logs, *, version="v0"):
     report_path.write_text(json.dumps(report, indent=2) + '\n')
 
 
+def step_base_check(tree, game, keys, logs, *, version):
+    """A base game whose code is not a target (BOTW): check its ExeFS bytes so a wrong or damaged dump stops here,
+    before the long RomFS merge, without rewriting that code."""
+    want = {n: h for n, h in VERSIONS[version]['base_exefs_sha256'].items() if not n.startswith('_')}
+    exefs = tree / 'extracted/v0/exefs'
+    if not source_matches(exefs.parent / 'extraction-manifest.json', game) or not all(
+            (exefs / n).is_file() and sha256(exefs / n) == h for n, h in want.items()):
+        say('1/4 code: checking the base game')
+        if exefs.exists():
+            shutil.rmtree(exefs)
+        run([tree / '.venv/bin/python', 'scripts/extract_exefs.py', game, '--keys', keys, *title_args(), '--output', exefs],
+            logs / 'extract_exefs-v0.log', cwd=tree)
+    for n, h in want.items():
+        if not (exefs / n).is_file():
+            raise BuildError(f'base ExeFS {n} is missing; not the supported base game')
+        check(f'base ExeFS {n}', sha256(exefs / n), h)
+
+
 def step_data(tree, game, keys, logs, *, firmware=None, shared_fonts=None):
     py = tree / '.venv/bin/python'
     romfs = tree / 'extracted/v0/romfs'
     index = romfs / 'index.json'
     ok = index.exists() and (romfs / 'romfs.bin').is_file() and json.loads(index.read_text()).get('romfs_sha256') == EXPECTED['romfs']['sha256'] and \
         (romfs / 'romfs.bin').stat().st_size == EXPECTED['romfs']['size']
-    if not ok:
+    if not ok and SELECTED['base_code']:   # BOTW: only the merged update RomFS is used (step_update_data)
         say('2/4 data: extracting and verifying the RomFS (17 GB, a minute or two)')
         if romfs.exists():
             shutil.rmtree(romfs)
@@ -354,6 +388,8 @@ def step_data(tree, game, keys, logs, *, firmware=None, shared_fonts=None):
             run([py, 'scripts/extract_shared_fonts.py', '--keys', keys, *source_args, '--output', fonts],
                 logs / 'shared_fonts.log', cwd=tree)
         validate_fonts(fonts)
+    if not SELECTED['base_code']:   # the RomFS overlays below edit TOTK's own data files
+        return
     if not (tree / 'extracted/v0/romfs-patches/manifest.tsv').exists():
         say('2/4 data: RomFS overlays (quick-menu capture timing, game-over retry)')
         run([py, 'scripts/make_romfs_patches.py'], logs / 'romfs_patches.log', cwd=tree)
@@ -466,12 +502,15 @@ def step_update_data(tree, game, update, keys, logs, *, version='v112'):
     expected = VERSIONS[version]
     folder = tree/f'extracted/{version}/romfs'
     index = folder/'index.json'
+    # BOTW 1.9.0: no merged image is recorded yet (the first examined base dump was damaged, docs/botw-port.md). Until
+    # then a merge passes on its six verified IVFC levels alone, and its hash is printed to be recorded.
+    recorded = expected.get('romfs')
     valid = False
     if index.is_file() and (folder/'romfs.bin').is_file():
         try:
             report = json.loads(index.read_text())
-            valid = (report.get('status') == 'pass' and report['romfs_sha256'] == expected['romfs']['sha256']
-                     and (folder/'romfs.bin').stat().st_size == expected['romfs']['size'])
+            valid = report.get('status') == 'pass' and (not recorded or (
+                report['romfs_sha256'] == recorded['sha256'] and (folder/'romfs.bin').stat().st_size == recorded['size']))
         except (ValueError, KeyError):
             pass
     if not valid:
@@ -480,10 +519,18 @@ def step_update_data(tree, game, update, keys, logs, *, version='v112'):
             shutil.rmtree(folder)
         say(f'2/4 update: merging base + {expected["display_version"]} and verifying all IVFC levels')
         run([tree/'.venv/bin/python', 'scripts/extract_update_romfs.py', game, update,
-             '--keys', keys, '--hactool', hactool, '--output', folder], logs/'update-romfs.log', cwd=tree)
+             '--keys', keys, *title_args(), '--hactool', hactool, '--output', folder], logs/'update-romfs.log', cwd=tree)
         report = json.loads(index.read_text())
-        check(f'{expected["display_version"]} RomFS', report['romfs_sha256'], expected['romfs']['sha256'])
-        check(f'{expected["display_version"]} RomFS size', report['romfs_size'], expected['romfs']['size'])
+        if recorded:
+            check(f'{expected["display_version"]} RomFS', report['romfs_sha256'], recorded['sha256'])
+            check(f'{expected["display_version"]} RomFS size', report['romfs_size'], recorded['size'])
+        else:
+            say(f'   all IVFC levels verified; this RomFS hash is not recorded yet: size {report["romfs_size"]}, '
+                f'SHA-256 {report["romfs_sha256"]}')
+    if not SELECTED['base_code']:   # BOTW: no TOTK overlays; the runtime's RomFS index is made here instead
+        run([tree/'.venv/bin/python', 'scripts/prepare_romfs_backend.py', '--version', version],
+            logs/f'{version}-romfs-backend.log', cwd=tree)
+        return
     for script, arguments in [('make_romfs_patches.py', []), ('make_output_res_overlay.py', ['2560x1440'])]:
         run([tree/'.venv/bin/python', 'scripts/'+script, *arguments, '--version', version],
             logs/(version+'-'+script+'.log'), cwd=tree)
@@ -674,11 +721,14 @@ def step_app(tree, out, logs, *, version="v0"):
 def parse_args(argv):
     ap = argparse.ArgumentParser(description='Build one native macOS app from TOTK base 1.0.0 (XCI/NSP), optionally with the separate 1.1.2 or 1.4.3 update.',
                                  epilog='example: python3 build_app.py ~/Games/totk.xci -k ~/keys/prod.keys')
-    ap.add_argument('game', type=Path, help='the game file (.xci or .nsp), base game 1.0.0')
+    ap.add_argument('game_file', metavar='game', type=Path, help='the game file (.xci or .nsp), base game 1.0.0')
     ap.add_argument('--update', type=Path, help='separate supported cumulative update NSP/NSZ; outputs the same single app')
     ap.add_argument('-k', '--keys', type=Path, required=True, help='your prod.keys')
     ap.add_argument('-o', '--out', type=Path, help=f'the app to write (default: "{APP_NAME}.app" next to the game file)')
-    ap.add_argument('--work', type=Path, help='work folder (default: TOTK_build next to the game file)')
+    ap.add_argument('--work', type=Path, help='work folder (default: TOTK_build or BOTW_build next to the game file)')
+    ap.add_argument('--game', choices=sorted(GAMES), default='totk',
+                    help='totk (default) or botw: BOTW base 1.0.0 with --update 1.9.0 prepares and verifies the code and '
+                         'data only; there is no BOTW runtime or app yet (docs/botw-port.md)')
     fonts = ap.add_mutually_exclusive_group()
     fonts.add_argument('--firmware', type=Path, help='unpacked firmware NCA directory providing the six expected shared fonts (needed for NSP unless --shared-fonts or valid cached fonts are available)')
     fonts.add_argument('--shared-fonts', type=Path, help='previously extracted shared-font directory containing the six verified .bfttf files')
@@ -686,14 +736,19 @@ def parse_args(argv):
 
 
 def main(argv):
+    global SELECTED
     args = parse_args(argv)
-    game, keys = args.game.expanduser().resolve(), args.keys.expanduser().resolve()
+    SELECTED = GAMES[args.game]
+    game, keys = args.game_file.expanduser().resolve(), args.keys.expanduser().resolve()
     if not game.is_file():
         raise BuildError(f'no such file: {game}')
     if not keys.is_file():
         raise BuildError(f'no such file: {keys}')
-    out = (args.out.expanduser().resolve() if args.out else game.parent / f'{APP_NAME}.app')
-    work = (args.work.expanduser().resolve() if args.work else game.parent / 'TOTK_build')
+    if not SELECTED['runtime'] and not args.update:
+        supported = ' or '.join(VERSIONS[v]['display_version'] for v in SELECTED['updates'])
+        raise BuildError(f'{SELECTED["name"]} needs its base game and --update {supported}: only that version is a port target')
+    out = (args.out.expanduser().resolve() if args.out else game.parent / f'{SELECTED["name"]}.app')
+    work = (args.work.expanduser().resolve() if args.work else game.parent / SELECTED['work'])
     if out.suffix != '.app':
         raise BuildError(f'the output must end in .app: {out}')
     kind = input_kind(game)
@@ -725,12 +780,20 @@ def main(argv):
     tree = prepare_work(work, py, logs)
     if update:
         version, update = identify_update(tree, update, keys, logs)
-    step_code(tree, game, keys, env, logs)
+    if SELECTED['base_code']:
+        step_code(tree, game, keys, env, logs)
+    else:
+        step_base_check(tree, game, keys, logs, version=version)
     if update:
         step_code(tree, update, keys, env, logs, version=version)
     step_data(tree, game, keys, logs, firmware=firmware, shared_fonts=shared_fonts)
     if update:
         step_update_data(tree, game, update, keys, logs, version=version)
+    if not SELECTED['runtime']:
+        say(f'done in {(time.time() - t0) / 60:.0f} min: {SELECTED["name"]} {VERSIONS[version]["display_version"]} code '
+            f'and data are verified in {tree}')
+        say(f'There is no {SELECTED["name"]} runtime yet, so no app was built (next steps: docs/botw-port.md).')
+        return
     step_shaders(tree, logs, version=version)
     step_shader_libs(tree, logs, version=version)
     step_binary(tree, game, keys, env, logs, version=version)
