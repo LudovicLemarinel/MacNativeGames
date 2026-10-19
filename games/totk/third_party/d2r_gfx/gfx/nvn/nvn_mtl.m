@@ -2266,7 +2266,12 @@ static void dead_keep_drop_range(uintptr_t lo, uintptr_t hi) {
    so the result outlives a temporary texture object finalized before the submission runs); an invalidate over its
    memory waits for the GPU and writes every level back in the NVN layout, unless the CPU has written the memory since
    the rendering (then the CPU's bytes are newer). Runtime switch: TOTK_INPUT_FILE "flag writeback 0|1" (default 1). */
-typedef struct { tex_t t; uint64_t stamp; void *obj; } wb_ent;
+/* The CPU-write check works on whole pages: a small texture shares its page with other data the CPU writes (BotW's
+   Magnesis picking renders the object under the reticle into 512-byte targets read back every frame; the page's other
+   writes skipped nearly every write-back, so the aimed object stayed red). Textures below WB_SNAP bytes keep a copy of
+   their memory taken at the rendering, and a dirty page counts as a CPU write only when those bytes changed. */
+#define WB_SNAP 65536
+typedef struct { tex_t t; uint64_t stamp; void *obj; uint8_t *snap; } wb_ent;
 static nvn_hmap g_wb = {.klen = 8};   // serial -> wb_ent * (g_smu): rendered since the last write-back
 static _Atomic int g_wb_on = 1;
 /* TOTK: fill the driver segment c0 for vertex and compute shaders (thread-group counts, uniform / storage address tables,
@@ -2367,7 +2372,7 @@ static int tilelog_match(const tex_t *t) {
     return on && t && t->d.width == w && t->d.height == h;
 }
 #define TILELOG(t, fmt, ...) do { if (tilelog_match(t)) MLOG("[tile] f%llu ser=%llu mem=%p nvnfmt=%#x lv%u " fmt, (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)(t)->serial, (void *)(t)->mem, (t)->d.format, (t)->d.levels, ##__VA_ARGS__); } while (0)
-static void wb_ent_free(wb_ent *e) { if (!e) return; if (e->obj) { defer_obj_release((__bridge id)e->obj); CFRelease(e->obj); } free(e); }
+static void wb_ent_free(wb_ent *e) { if (!e) return; if (e->obj) { defer_obj_release((__bridge id)e->obj); CFRelease(e->obj); } free(e->snap); free(e); }
 static void wb_note(const tex_t *t) {
     TILELOG(t, "GPU render (owned %d)", gpu_owned(t->serial));
     if (!atomic_load(&g_wb_on) || !t->mem || !t->L.size) return;
@@ -2376,10 +2381,9 @@ static void wb_note(const tex_t *t) {
     uint64_t stamp = nvn_dirty_now(), k = t->serial;
     pthread_mutex_lock(&g_smu);
     wb_ent *e = nvn_hm_get(&g_wb, &k);
-    if (e) { e->stamp = stamp; e->t = *t; pthread_mutex_unlock(&g_smu); return; }
-    e = calloc(1, sizeof *e); if (!e) MDIE("write-back record");
-    e->t = *t; e->stamp = stamp; e->obj = (void *)CFBridgingRetain(o);
-    nvn_hm_put(&g_wb, &k, e);
+    if (e) { e->stamp = stamp; e->t = *t; if (e->snap) { free(e->snap); e->snap = NULL; } }
+    else { e = calloc(1, sizeof *e); if (!e) MDIE("write-back record"); e->t = *t; e->stamp = stamp; e->obj = (void *)CFBridgingRetain(o); nvn_hm_put(&g_wb, &k, e); }
+    if (t->L.size <= WB_SNAP && (e->snap = malloc(t->L.size))) memcpy(e->snap, t->mem, t->L.size);
     pthread_mutex_unlock(&g_smu);
 }
 static int wb_level_back(const tex_t *t, id<MTLTexture> mt, unsigned level, unsigned layer) {
@@ -2414,7 +2418,8 @@ void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
     /* Freshness is decided for every entry before anything is written back (a write-back marks its pages written), and
        of several renderings of the same memory (texture objects over it) only the newest is written back. */
     int fresh[512];
-    for (int i = 0; i < nl; i++) fresh[i] = !nvn_dirty_since(list[i]->t.mem, list[i]->t.L.size, list[i]->stamp);
+    for (int i = 0; i < nl; i++) { const wb_ent *e = list[i];
+        fresh[i] = !nvn_dirty_since(e->t.mem, e->t.L.size, e->stamp) || (e->snap && !memcmp(e->snap, e->t.mem, e->t.L.size)); }   // see WB_SNAP
     for (int i = 0; i < nl; i++) for (int j = 0; j < nl; j++)
         if (i != j && fresh[i] && fresh[j] && list[j]->t.mem == list[i]->t.mem && list[j]->stamp > list[i]->stamp) { fresh[i] = 2; break; }   // 2: superseded
     for (int i = 0; i < nl; i++) {
