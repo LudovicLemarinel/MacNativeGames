@@ -5,7 +5,7 @@
 
 Supported: TOTK base 1.0.0 (0100F2C0115B6000), XCI or NSP; optional --update with a supported cumulative update.
 NSPs need common tickets (unless rights-free) and a separate shared-font source. No iPhone/iOS builds are supported.
-In preparation: --game botw with BOTW base 1.0.0 and --update 1.9.0 stops after the verified code and data (no app yet).
+In preparation: --game botw with BOTW base 1.0.0 and --update 1.9.0 (no game patches or startup shader seed yet).
 Nothing from the game is in this repository; everything is made from your files on your Mac. Key values are never printed.
 
 Steps (each one checked against games/totk/assets/expected-v<version>.json, so a damaged dump or another version stops the
@@ -37,13 +37,14 @@ UPDATED = json.loads((GAME / 'assets/expected-v1.1.2.json').read_text())
 UPDATED143 = json.loads((GAME / 'assets/expected-v1.4.3.json').read_text())
 BOTW190 = json.loads((REPO / 'games/botw/assets/expected-v1.9.0.json').read_text())
 VERSIONS = {'v0': EXPECTED, 'v112': UPDATED, 'v143': UPDATED143, 'v190': BOTW190}
-# --game: TOTK builds the app; BOTW (in preparation, docs/botw-port.md) has no runtime yet, so its build stops after
-# the verified code and data. BOTW's 1.0.0 code is not a target: its base game only supplies the RomFS under 1.9.0.
+# --game: TOTK (default) or BOTW (in preparation, docs/botw-port.md: no game patches, no startup shader seed yet).
+# BOTW's 1.0.0 code is not a target: its base game only supplies the RomFS under 1.9.0. define: the launcher's version
+# macro prefix; seed: TOTK's startup shader seed (prepare_shader_seed.py reads TOTK's own shader packages).
 GAMES = {
     'totk': dict(name='Tears of the Kingdom', title_id='0100F2C0115B6000', updates=('v112', 'v143'), work='TOTK_build',
-                 base_code=True, runtime=True),
+                 base_code=True, seed=True, executable='TOTK', bundle_id='org.macnativegames.totk', define='TOTK_GAME_'),
     'botw': dict(name='Breath of the Wild', title_id='01007EF00011E000', updates=('v190',), work='BOTW_build',
-                 base_code=False, runtime=False),
+                 base_code=False, seed=False, executable='BOTW', bundle_id='org.macnativegames.botw', define='BOTW_GAME_'),
 }
 SELECTED = GAMES['totk']
 HACTOOL = ('https://github.com/SciresM/hactool.git', '1d64a83450e025622f3468c28fc4164dad2c5ef6')
@@ -561,6 +562,9 @@ def step_shaders(tree, logs, *, version='v0'):
     if not translator.is_file() or sha256(translator) != want:
         raise BuildError(f'{translator}: not the shader translator this repository ships (its SHA-256 differs from '
                          f'totk_xlate.sha256); check it out again, or rebuild it with games/totk/tools/totk_xlate/publish_native.sh')
+    if not SELECTED['seed']:
+        say(f'3/4 shaders: no startup shader seed for {SELECTED["name"]} yet; shaders are translated as they appear')
+        return
     say('3/4 shaders: discovering and translating startup shaders from your game data')
     run([tree/'.venv/bin/python', 'scripts/prepare_shader_seed.py',
          '--romfs', tree/f'extracted/{version}/romfs', '--output', tree/f'build/shader-seed/{version}',
@@ -586,6 +590,8 @@ def step_shader_libs(tree, logs, *, version='v0'):
     """Compile the startup shaders ahead of time. Metal's own cache of shaders compiled at launch starts over when the
     app is moved or rebuilt; these files go inside the app. Each is named by the SHA-256 of its source, so the game
     loads only an exact match, and a rebuild reuses every shader that did not change."""
+    if not SELECTED['seed']:
+        return
     sources = sorted((tree/f'build/shader-seed/{version}').glob('*.metal'))
     found = metal_compiler()
     if not found:
@@ -627,11 +633,12 @@ def step_shader_libs(tree, logs, *, version='v0'):
 def step_binary(tree, game, keys, env, logs, *, version="v0"):
     say('4/4 app: building the game binary and the launcher')
     run(['make', 'runtime' if version == 'v0' else f'runtime-{version}'], logs / 'runtime.log', cwd=tree, env=env)
-    run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Ithird_party/d2r_gfx/gfx/nvn', '-Iruntime', *([] if version == 'v0' else [f'-DTOTK_GAME_{version.upper()}=1']), 'app/launcher.m', '-framework', 'AppKit',
+    run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Ithird_party/d2r_gfx/gfx/nvn', '-Iruntime', *([] if version == 'v0' else [f'-D{SELECTED["define"]}{version.upper()}=1']), 'app/launcher.m', '-framework', 'AppKit',
          '-o', 'build/app-launcher'], logs / 'launcher.log', cwd=tree, env=env)
     if not (tree / 'build/AppIcon.icns').exists():   # the game's own icon from its control data; optional
         try:
-            run([tree / '.venv/bin/python', 'scripts/extract_app_icon.py', game, '--keys', keys, '--output', 'build/AppIcon.icns'],
+            run([tree / '.venv/bin/python', 'scripts/extract_app_icon.py', game, '--keys', keys, '--title', SELECTED['title_id'],
+                 '--output', 'build/AppIcon.icns'],
                 logs / 'app_icon.log', cwd=tree)
         except BuildError as e:
             say(f'   no app icon, the app gets the default one ({str(e).splitlines()[0]})')
@@ -672,24 +679,28 @@ def step_app(tree, out, logs, *, version="v0"):
     for rel in (f'extracted/{version}/romfs-patches', f'extracted/{version}/romfs-patches-out', 'extracted/firmware/shared-fonts'):
         copy_tree(tree / rel, res / rel)
     seed = tree/f'build/shader-seed/{version}'
-    if not (seed/'seed-manifest.json').is_file():
-        raise BuildError('startup shader seed was not prepared; refusing an app without first-launch warm-up data')
-    try:
-        report = json.loads((seed/'seed-manifest.json').read_text())
-        if (report['version'] != version or report['chain'] != 'totk-native-v4-unverified' or
-                report['shaders'] < 8000 or not report['files'] or any(
-                    Path(name).name != name or sha256(seed/name) != digest for name, digest in report['files'].items())):
-            raise ValueError('version, translation chain or file hash differs')
-    except (ValueError, KeyError, OSError, TypeError) as error:
-        raise BuildError(f'invalid prepared startup shader seed: {error}') from None
-    copy_tree(seed, res/'build/shader-seed')
+    if not SELECTED['seed']:
+        # TOTK's PSO list names TOTK shaders only: the app gets an empty list, and play collects its own (pso_collected.tsv)
+        (res/'build/pso_manifest.tsv').write_text(f'# {SELECTED["name"]}: no prepared PSO list; shaders are collected while playing\n')
+    else:
+        if not (seed/'seed-manifest.json').is_file():
+            raise BuildError('startup shader seed was not prepared; refusing an app without first-launch warm-up data')
+        try:
+            report = json.loads((seed/'seed-manifest.json').read_text())
+            if (report['version'] != version or report['chain'] != 'totk-native-v4-unverified' or
+                    report['shaders'] < 8000 or not report['files'] or any(
+                        Path(name).name != name or sha256(seed/name) != digest for name, digest in report['files'].items())):
+                raise ValueError('version, translation chain or file hash differs')
+        except (ValueError, KeyError, OSError, TypeError) as error:
+            raise BuildError(f'invalid prepared startup shader seed: {error}') from None
+        copy_tree(seed, res/'build/shader-seed')
     for src in sorted(seed.glob('*.metal')):
         lib = tree/f'build/shader-libs/{sha256(src)}.metallib'
         if lib.is_file():
             clone(lib, res/'build/shader-libs'/lib.name)
-    clone(tree / 'build/app-launcher', tmp / 'Contents/MacOS/TOTK')
-    info = dict(CFBundleDevelopmentRegion='en', CFBundleExecutable='TOTK', CFBundleIdentifier=BUNDLE_ID, CFBundleName=APP_NAME,
-                CFBundleDisplayName=APP_NAME, CFBundlePackageType='APPL', CFBundleShortVersionString=expected['display_version'],
+    clone(tree / 'build/app-launcher', tmp / 'Contents/MacOS' / SELECTED['executable'])
+    info = dict(CFBundleDevelopmentRegion='en', CFBundleExecutable=SELECTED['executable'], CFBundleIdentifier=SELECTED['bundle_id'],
+                CFBundleName=SELECTED['name'], CFBundleDisplayName=SELECTED['name'], CFBundlePackageType='APPL', CFBundleShortVersionString=expected['display_version'],
                 CFBundleVersion=str(expected['version'] + 1), LSMinimumSystemVersion='26.0', NSHighResolutionCapable=True,
                 LSApplicationCategoryType='public.app-category.action-games', LSSupportsGameMode=True,
                 GCSupportsControllerUserInteraction=True)
@@ -727,8 +738,8 @@ def parse_args(argv):
     ap.add_argument('-o', '--out', type=Path, help=f'the app to write (default: "{APP_NAME}.app" next to the game file)')
     ap.add_argument('--work', type=Path, help='work folder (default: TOTK_build or BOTW_build next to the game file)')
     ap.add_argument('--game', choices=sorted(GAMES), default='totk',
-                    help='totk (default) or botw: BOTW base 1.0.0 with --update 1.9.0 prepares and verifies the code and '
-                         'data only; there is no BOTW runtime or app yet (docs/botw-port.md)')
+                    help='totk (default) or botw: BOTW needs its base 1.0.0 and --update 1.9.0; in preparation, without game '
+                         'patches or startup shader seed (docs/botw-port.md)')
     fonts = ap.add_mutually_exclusive_group()
     fonts.add_argument('--firmware', type=Path, help='unpacked firmware NCA directory providing the six expected shared fonts (needed for NSP unless --shared-fonts or valid cached fonts are available)')
     fonts.add_argument('--shared-fonts', type=Path, help='previously extracted shared-font directory containing the six verified .bfttf files')
@@ -744,7 +755,7 @@ def main(argv):
         raise BuildError(f'no such file: {game}')
     if not keys.is_file():
         raise BuildError(f'no such file: {keys}')
-    if not SELECTED['runtime'] and not args.update:
+    if not SELECTED['base_code'] and not args.update:
         supported = ' or '.join(VERSIONS[v]['display_version'] for v in SELECTED['updates'])
         raise BuildError(f'{SELECTED["name"]} needs its base game and --update {supported}: only that version is a port target')
     out = (args.out.expanduser().resolve() if args.out else game.parent / f'{SELECTED["name"]}.app')
@@ -789,11 +800,6 @@ def main(argv):
     step_data(tree, game, keys, logs, firmware=firmware, shared_fonts=shared_fonts)
     if update:
         step_update_data(tree, game, update, keys, logs, version=version)
-    if not SELECTED['runtime']:
-        say(f'done in {(time.time() - t0) / 60:.0f} min: {SELECTED["name"]} {VERSIONS[version]["display_version"]} code '
-            f'and data are verified in {tree}')
-        say(f'There is no {SELECTED["name"]} runtime yet, so no app was built (next steps: docs/botw-port.md).')
-        return
     step_shaders(tree, logs, version=version)
     step_shader_libs(tree, logs, version=version)
     step_binary(tree, game, keys, env, logs, version=version)
@@ -806,7 +812,7 @@ def main(argv):
     # check-only mode, so the player's first start is immediate.
     say('4/4 app: macOS checks the new app once (a few minutes for the 16 GB bundle)')
     t1 = time.time()
-    r = subprocess.run([out / 'Contents/MacOS/TOTK', '--check'], capture_output=True, text=True, timeout=1800)
+    r = subprocess.run([out / 'Contents/MacOS' / SELECTED['executable'], '--check'], capture_output=True, text=True, timeout=1800)
     if r.returncode:
         raise BuildError(f'the app does not start: {(r.stdout + r.stderr).strip()}')
     say(f'   checked in {time.time() - t1:.0f} s')

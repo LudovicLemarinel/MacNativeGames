@@ -10,6 +10,7 @@
 #define TOTK_GAME_VERSION "1.9.0"
 #define TOTK_GAME_DIR "v190"
 #define GAME_TITLE_ID 0x01007ef00011e000ULL
+#define GAME_DISPLAY_NAME "Breath of the Wild"
 #elif defined(TOTK_GAME_V143)
 #define TOTK_GAME_VERSION "1.4.3"
 #define TOTK_GAME_DIR "v143"
@@ -99,4 +100,7 @@
 #endif
 #ifndef GAME_TITLE_ID
 #define GAME_TITLE_ID 0x0100f2c0115b6000ULL
+#endif
+#ifndef GAME_DISPLAY_NAME
+#define GAME_DISPLAY_NAME "Tears of the Kingdom"
 #endif
