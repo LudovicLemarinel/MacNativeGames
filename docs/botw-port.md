@@ -40,7 +40,7 @@ these indices; `nn::fs::MountAddOnContent` mounts one as a second read-only volu
 folder, `TOTK_AOC=0` none. `totk-native-v190 rewritten/v190 probe-fs` lists, mounts, reads (byte-compared with the
 image) and unmounts each DLC: pass (2026-10-19, 17 sampled DLC files); a damaged image stops the start.
 
-Not checked yet: the game itself with the DLC (its title menu, the Master Trials and Champions' Ballad content).
+In the game (2026-10-19): it reports the DLC as present. Not checked yet: the Master Trials and Champions' Ballad content.
 
 Merged RomFS (2026-10-19, M4): 15,132,662,100 bytes, SHA-256 `826b373b…ae429dad`, all six IVFC levels verified, about
 two minutes. Its 41,062 files are indexed for the runtime (`extracted/v190/romfs/runtime-index.bin`).
