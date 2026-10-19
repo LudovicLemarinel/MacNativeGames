@@ -3,7 +3,14 @@
 #pragma once
 #define GAME_ADDR_JOIN(x) GAME_ADDR_##x
 #define GAME_ADDR(x) GAME_ADDR_JOIN(x)
-#if defined(TOTK_GAME_V143)
+#if defined(BOTW_GAME_V190)
+/* BOTW 1.9.0 (docs/botw-port.md): none of TOTK's main offsets apply. GAME_ADDR has no entries, so any TOTK-only
+   site that is not compiled out for GAME_BOTW stops the build. */
+#define GAME_BOTW 1
+#define TOTK_GAME_VERSION "1.9.0"
+#define TOTK_GAME_DIR "v190"
+#define GAME_TITLE_ID 0x01007ef00011e000ULL
+#elif defined(TOTK_GAME_V143)
 #define TOTK_GAME_VERSION "1.4.3"
 #define TOTK_GAME_DIR "v143"
 #define GAME_ADDR_0x15ecb0c 0x1bd01c4
@@ -89,4 +96,7 @@
 #define GAME_ADDR_0x453f648 0x453f648
 #define GAME_ADDR_0x8f6cbc 0x8f6cbc
 #define GAME_OUTPUT_CALL_WORD 0x94000082u
+#endif
+#ifndef GAME_TITLE_ID
+#define GAME_TITLE_ID 0x0100f2c0115b6000ULL
 #endif

@@ -16,6 +16,15 @@
 #include "dmsh_chain.h"   // DMSH_CHAIN: the shader translation chain the cache folder is named after
 #include "game_version.h"
 
+// Each game keeps its own profile, saves, shader cache and log (BOTW never shares TOTK's folders).
+#ifdef GAME_BOTW
+#define GAME_DATA_NAME @"BOTW"
+#define GAME_LOG_NAME @"botw"
+#else
+#define GAME_DATA_NAME @"TOTK"
+#define GAME_LOG_NAME @"totk"
+#endif
+
 static void show_error(NSString *detail) {
     NSAlert *alert = [NSAlert new];
     alert.messageText = @"The game could not start";
@@ -83,7 +92,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         NSString *home = NSHomeDirectory();
-        NSString *data = [home stringByAppendingPathComponent:@"Library/Application Support/MacNativeGames/TOTK"];
+        NSString *data = [home stringByAppendingPathComponent:@"Library/Application Support/MacNativeGames/" GAME_DATA_NAME];
         NSString *logs = [home stringByAppendingPathComponent:@"Library/Logs/MacNativeGames"];
         /* Folders the environment already names are kept (open --env TOTK_PROFILE_DIR=... runs a test on a save copy,
            TOTK_GAME_SLOT_DIR shares one game slot with another build of the game: one game at a time on the Mac). */
@@ -137,9 +146,9 @@ int main(int argc, char **argv) {
           FILE *cf = fopen(cmds.fileSystemRepresentation, "w"); if (cf) fclose(cf);
           setenv("TOTK_INPUT_FILE", cmds.fileSystemRepresentation, 1); }
 
-        NSString *log = [logs stringByAppendingPathComponent:@"totk.log"];
-        [NSFileManager.defaultManager removeItemAtPath:[logs stringByAppendingPathComponent:@"totk.previous.log"] error:nil];
-        [NSFileManager.defaultManager moveItemAtPath:log toPath:[logs stringByAppendingPathComponent:@"totk.previous.log"] error:nil];
+        NSString *log = [logs stringByAppendingPathComponent:GAME_LOG_NAME @".log"];
+        [NSFileManager.defaultManager removeItemAtPath:[logs stringByAppendingPathComponent:GAME_LOG_NAME @".previous.log"] error:nil];
+        [NSFileManager.defaultManager moveItemAtPath:log toPath:[logs stringByAppendingPathComponent:GAME_LOG_NAME @".previous.log"] error:nil];
         FILE *lf = fopen(log.fileSystemRepresentation, "w");
         if (lf) {
             dup2(fileno(lf), STDOUT_FILENO);

@@ -314,6 +314,7 @@ static void crash(int num,siginfo_t *info,void *context) {
  ucontext_t *u=context;
  /* During save load, this optional game object can contain a tagged invalid
     reference. Treat it as absent, as the following cbz path expects. */
+#ifndef GAME_BOTW
  if(num==SIGSEGV&&modules[0].base&&
     u->uc_mcontext->__ss.__pc==(uintptr_t)modules[0].base+GAME_ADDR(0x15ecb0c)&&
     (uintptr_t)info->si_addr==0xffff0000ffffffffULL&&
@@ -332,6 +333,7 @@ static void crash(int num,siginfo_t *info,void *context) {
    }
   }
  }
+#endif
  /* EL0 cache maintenance that Darwin traps but Horizon allows: emulate exactly two encodings (SDK only). */
  if(num==SIGILL){uint32_t insn=*(const uint32_t *)(uintptr_t)u->uc_mcontext->__ss.__pc;unsigned rt=insn&31;
   if((insn&~31u)==0xd53b0020u){if(rt!=31)u->uc_mcontext->__ss.__x[rt]=HOST_CTR_EL0;u->uc_mcontext->__ss.__pc+=4;return;}   /* mrs Xt, CTR_EL0 */
@@ -409,7 +411,7 @@ int runtime_module_offset(uint64_t pc,const char **name,uint64_t *off) {
  return 0;
 }
 uintptr_t runtime_frame_controller_return_pc(void) {
-#ifdef TOTK_GAME_V143
+#if defined(TOTK_GAME_V143) || defined(GAME_BOTW)
  return 0; /* The older graphics diagnostic reads the pre-1.4 controller layout. */
 #else
  return (uintptr_t)modules[0].base + GAME_ADDR(0x8f6cbc);
@@ -424,9 +426,13 @@ static void module_inits(void) {
 }
 void runtime_startup_checkpoint(uintptr_t caller) {
  if(!getenv("TOTK_VERIFY_STARTUP"))return;
+#ifdef GAME_BOTW
+ (void)caller;runtime_fail("TOTK_VERIFY_STARTUP: BOTW's nnMain checkpoint is not located yet");
+#else
  need(caller==(uintptr_t)modules[0].base+GAME_ADDR(0xe995c4),"checkpoint not reached from original nnMain");
  for(unsigned i=0;i<NM;i++){uint32_t state;memcpy(&state,modules[i].base+modules[i].ctor_flag,4);need(state==2,"constructor checkpoint state");}
  printf("{\"status\":\"pass\",\"phase\":4,\"original_nnMain_return_pc\":\"0x%x\",\"scope\":\"all DT_INIT constructor loops completed; original nnMain prefix executed; stops at focus setup\"}\n", GAME_ADDR(0xe995c4));fflush(stdout);_exit(0);
+#endif
 }
 static void module_finis(void) { runtime_fail("guest exited: module finalizers not yet implemented"); }
 static void boot(void) {

@@ -198,7 +198,11 @@ void runtime_swkbd_selftest(void) {
 
 /* ---------- probe (make probe-swkbd): guest SDK arguments, main's PLT stub, no window ---------- */
 #include "game_version.h"
+#ifdef GAME_BOTW
+enum { MAIN_PLT_SHOW_KEYBOARD = 0, MAIN_GOT_SHOW_KEYBOARD = 0 };   /* not located in BOTW's main yet; the probe refuses */
+#else
 enum { MAIN_PLT_SHOW_KEYBOARD = GAME_ADDR(0x2aa4fa0), MAIN_GOT_SHOW_KEYBOARD = GAME_ADDR(0x453f648) };   /* scripts/re/calls.py main <ShowKeyboard> */
+#endif
 static unsigned checks;
 static void need(int ok, const char *what) { checks++; if (!ok) { fprintf(stderr, "swkbd probe: %s\n", what); runtime_fail("software keyboard probe failed"); } }
 static void *sym(const char *name) { void *p = runtime_symbol(name); if (!p) { fprintf(stderr, "swkbd probe: no %s\n", name); runtime_fail("software keyboard probe: guest symbol"); } return p; }
@@ -222,6 +226,9 @@ static void *probe_thread(void *unused) {
     WorkSize work_size = (WorkSize)sym("_ZN2nn5swkbd25GetRequiredWorkBufferSizeEb");
     uint8_t *main_base = runtime_module_base("main");
     need(main_base != NULL, "main module base");
+#ifdef GAME_BOTW
+    runtime_fail("software keyboard probe: BOTW's ShowKeyboard PLT/GOT are not located yet");
+#endif
     void *got; memcpy(&got, main_base + MAIN_GOT_SHOW_KEYBOARD, 8);
     need(got == runtime_hle_wrap((void *)show_keyboard), "main's ShowKeyboard GOT slot holds the host keyboard");
     Show show = (Show)(void *)(main_base + MAIN_PLT_SHOW_KEYBOARD);

@@ -87,6 +87,13 @@ static uint32_t show_controller_support(ControllerSupportResult *out,const void 
  return 0;
 }
 /* Vibration devices and the six-axis sensor: runtime/hid_feedback.c (none unless TOTK_RUMBLE=1 / TOTK_GYRO=1). */
+static uint32_t show_controller_support_arg(const void *arg){return show_controller_support(NULL,arg);}
+/* BOTW: the Labo VR "seven six-axis sensor" is absent (it starts and stops, and never has a state); joy-con pairing and
+   gyroscope zero-drift settings have no Mac controller to configure. */
+static uint32_t seven_init(void *work,uint64_t size){(void)work;(void)size;return 0;}
+static uint32_t seven_ok(void){return 0;}
+static int seven_states(void *states,int count){(void)states;(void)count;return 0;}
+static void npad_setting(const void *a,const void *b){(void)a;(void)b;}
 void *runtime_input_override(const char *name){
  void *feedback=runtime_hid_feedback_override(name);if(feedback)return feedback;
  static const struct{const char *name;void *fn;} entries[]={
@@ -97,7 +104,13 @@ void *runtime_input_override(const char *name){
  {"_ZN2nn3hid18SetNpadJoyHoldTypeENS0_15NpadJoyHoldTypeE",hold_type},{"_ZN2nn3hid14DisconnectNpadERKj",disconnect},
  {"_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgE",show_controller_support},
  {"_ZN2nn3hid15InitializeMouseEv",initialize_mouse},{"_ZN2nn3hid18InitializeKeyboardEv",initialize_keyboard},
- {"_ZN2nn3hid14GetMouseStatesEPNS0_10MouseStateEi",mouse_states},{"_ZN2nn3hid16GetKeyboardStateEPNS0_13KeyboardStateE",keyboard_state}};
+ {"_ZN2nn3hid14GetMouseStatesEPNS0_10MouseStateEi",mouse_states},{"_ZN2nn3hid16GetKeyboardStateEPNS0_13KeyboardStateE",keyboard_state},
+ {"_ZN2nn3hid21ShowControllerSupportERKNS0_20ControllerSupportArgE",show_controller_support_arg},
+ {"_ZN2nn3hid28InitializeSevenSixAxisSensorEPvm",seven_init},{"_ZN2nn3hid26FinalizeSevenSixAxisSensorEv",seven_ok},
+ {"_ZN2nn3hid23StartSevenSixAxisSensorEv",seven_ok},{"_ZN2nn3hid22StopSevenSixAxisSensorEv",seven_ok},
+ {"_ZN2nn3hid32ResetSevenSixAxisSensorTimestampEv",seven_ok},{"_ZN2nn3hid27GetSevenSixAxisSensorStatesEPNS0_23SevenSixAxisSensorStateEi",seven_states},
+ {"_ZN2nn3hid28SetNpadJoyAssignmentModeDualERKj",npad_setting},
+ {"_ZN2nn3hid25SetGyroscopeZeroDriftModeERKNS0_19SixAxisSensorHandleERKNS0_22GyroscopeZeroDriftModeE",npad_setting}};
  for(unsigned i=0;i<sizeof(entries)/sizeof(*entries);i++)if(!strcmp(name,entries[i].name))return entries[i].fn;return NULL;
 }
 

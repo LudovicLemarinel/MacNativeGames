@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'third_party/d2r'))
 from relr import decode_relr
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--version', choices=('v0','v112','v143'), default='v0')
+parser.add_argument('--version', choices=('v0','v112','v143','v190'), default='v0')
 version = parser.parse_args().version
 OUT = ROOT / ('build' if version == 'v0' else f'build/{version}')
 OUT.mkdir(parents=True, exist_ok=True)
@@ -23,6 +23,8 @@ if version == 'v112':
     assert report['module_file_sha256']['extracted/v112/exefs/main'] == expected, 'Unsupported 1.1.2 main image'
 if version == 'v143':
     assert report['module_file_sha256']['extracted/v143/exefs/main'] == 'e84a90d551fed0824b4b74933b9c6d043c458521363a7cea58b2faca1822dc9e', 'Unsupported 1.4.3 main image'
+if version == 'v190':
+    assert report['module_file_sha256']['extracted/v190/exefs/main'] == 'f6f0b20bb1f2b67d164c24871cd473147eef1d285f12e7bd492e3126c6022e27', 'Unsupported BOTW 1.9.0 main image'
 modules = []
 for name in ['main', 'subsdk0', 'sdk']:
     path = ROOT / f'rewritten/{version}/{name}.patched.bin'
@@ -80,7 +82,7 @@ for name in ['main', 'subsdk0', 'sdk']:
         assert kind in ['cntpct', 'cntvct', 'svc']
         gates.append(dict(ret=int(ret, 0), timer=kind != 'svc', arg=int(arg), original=int(original, 0)))
     # Match each compiler's actual DT_INIT state load before decoding it.
-    flag_reg, load_offset = (19, 20) if version == 'v143' else (20, 24)
+    flag_reg, load_offset = (19, 20) if version in ('v143', 'v190') else (20, 24)
     a, w = struct.unpack_from('<I', image, tags[12]+16)[0], struct.unpack_from('<I', image, tags[12]+load_offset)[0]
     assert a & 0x9f00001f == 0x90000000 | flag_reg and w & 0xffc003ff == 0xb9400008 | (flag_reg << 5)
     imm = ((a >> 29) & 3) | (((a >> 5) & 0x7ffff) << 2)

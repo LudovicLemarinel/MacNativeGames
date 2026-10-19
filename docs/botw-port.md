@@ -94,17 +94,38 @@ LLVM_BIN=/opt/homebrew/opt/llvm/bin DM_VCACHE=$W/llvm-cache $W/venv/bin/python t
 
 The equivalence run took a few minutes on an M4 with 6 jobs. The DLC pack was not examined.
 
+## Runtime profile and first boot
+
+`make runtime-v190` (in the work folder's `totk` tree) builds `build/totk-native-v190` from the shared runtime with
+`-DBOTW_GAME_V190`:
+
+- `game_version.h`: `GAME_BOTW`, version `1.9.0`, data folder `v190` and the BOTW title ID (`GAME_TITLE_ID`, used by
+  `fs_host.c` for save access and by `services.c` for the program ID). No TOTK `GAME_ADDR` entry exists for BOTW, so an
+  unguarded TOTK site fails to compile. The crash filter, frame-controller diagnostic, startup checkpoint, world survey
+  and keyboard probe are compiled out; `game_patches_botw.c` applies no game patch.
+- `prepare_runtime.py --version v190`: BOTW's DT_INIT has the same layout as TOTK 1.4.3 (same compiler).
+- The launcher keeps BOTW's profile, saves, shader cache and log apart (`MacNativeGames/BOTW`, `botw.log`).
+- SDK functions BOTW uses and TOTK does not, answered by the host: `nn::hid` Labo VR "seven six-axis sensor" (absent),
+  joy-con dual assignment, gyroscope zero-drift mode, `ShowControllerSupport(arg)`; `nn::account::ListAllUsers` (the
+  local account); `nn::pl` VR mode (never entered) and `RequestSharedFontLoad`; `nn::pctl::CheckStereoVisionPermission`;
+  `nn::oe::EnableRecording`; `nn::fs::CommitSaveData`; `IAudioRenderer` commands 12/13 (voice drop parameter).
+- NVN depth mode: BOTW never calls `nvnDeviceSetDepthMode` and relies on NVN's default, `NEAR_IS_MINUS_W` (GL clip z).
+  The host's flag now starts at that default, so vertex shaders get the `z = (z + w) / 2` conversion. Without it the
+  title menu was rendered correctly into an intermediate target (frame-800 texture dump), but the final composition
+  quad at clip z = -1 was clipped by Metal and the window stayed black. TOTK sets this mode explicitly and its seed
+  preparation already assumes it, so TOTK is unaffected. Shader caches made before this change must be discarded (the
+  depth flag is not part of the variant key).
+
+First boot (2026-10-19, M5, test profile under `MacNativeGames/BOTW/tests`): the game reaches the "Nintendo présente"
+intro and its title menu, with audio, at about 2,700 draws per frame. Not yet checked: controller input on the title
+menu, loading a game, gameplay.
+
 ## Next steps
 
-1. ~~Game selection in the build~~ (`--game`, done for the code and data steps) and ~~RomFS~~ (done). The runtime side
-   still hard-codes TOTK: the Makefile, `fs_host.c`, `services.c` and `extract_app_icon.py` use its title ID, names
-   and paths (`TOTK_*` environment variables, the `MacNativeGames/TOTK` profile folder). Proposed: let `games/botw`
-   reuse `games/totk`'s runtime with a `BOTW_GAME_V190` profile in `game_version.h` and a `runtime-v190` target.
-2. **First boot.** Load the three rewritten modules; leave out every TOTK-specific `GAME_ADDR` patch (the 60 FPS
-   controller, output resolution, crash filter at `0x15ecb0c`, startup checkpoint, swkbd PLT/GOT, world survey).
-   Follow the logs to the first NVN frames.
-3. **BOTW-specific patches**, to be found again in BOTW's main: frame pacing and the 30 FPS cap, output resolution,
+1. **App packaging** for `--game botw`: build `runtime-v190` and the launcher with `-DBOTW_GAME_V190`, copy the
+   translator and SPIRV-Cross, and allow an app without TOTK's startup shader seed (it needs at least 8,000 shaders).
+2. **BOTW-specific patches**, to be found again in BOTW's main: frame pacing and the 30 FPS cap, output resolution,
    the software keyboard entry (horse naming). The zeldaret/botw decompilation (Switch 1.5.0) can help locate functions,
    but its addresses do not apply to 1.9.0.
-4. **Shaders and data.** Startup shader seeding from BOTW's `.sbfres` / shader archives; any heap or RomFS overlays the
+3. **Shaders and data.** Startup shader seeding from BOTW's `.sbfres` / shader archives; any heap or RomFS overlays the
    higher output resolution needs.

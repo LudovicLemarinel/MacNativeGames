@@ -33,10 +33,12 @@ static int valid(int type){if(type<0||type>=SHARED_FONT_COUNT)runtime_fail("inva
 static int load_state(int type){valid(type);return 1;}   /* SharedFontLoadState_Loaded */
 static const void *address(int type){return region+offsets[valid(type)];}
 static size_t size(int type){return (size_t)rows[valid(type)].font_bytes;}
+static void request_load(int type){valid(type);}   /* already loaded at the first query */
 void *runtime_font_override(const char *name){
  static const struct{const char *name;void *fn;} entries[]={
   {"_ZN2nn2pl22GetSharedFontLoadStateENS0_14SharedFontTypeE",load_state},
   {"_ZN2nn2pl20GetSharedFontAddressENS0_14SharedFontTypeE",address},
-  {"_ZN2nn2pl17GetSharedFontSizeENS0_14SharedFontTypeE",size}};
+  {"_ZN2nn2pl17GetSharedFontSizeENS0_14SharedFontTypeE",size},
+  {"_ZN2nn2pl21RequestSharedFontLoadENS0_14SharedFontTypeE",request_load}};
  for(unsigned i=0;i<sizeof(entries)/sizeof(*entries);i++)if(!strcmp(name,entries[i].name))return entries[i].fn;return NULL;
 }
