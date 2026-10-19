@@ -669,6 +669,7 @@ void mtl_pool_add(const void *mem, uint64_t size) {
 }
 
 static void stor_drop_range(uintptr_t lo, uintptr_t hi);
+static void dead_keep_drop_range(uintptr_t lo, uintptr_t hi);
 static void stor_sweep(uint64_t fence);
 void mtl_pool_del(const void *mem) {
     g_reg_gen++;
@@ -684,6 +685,7 @@ void mtl_pool_del(const void *mem) {
     }
     pthread_mutex_unlock(&g_mu);
     if (hi > lo) stor_drop_range(lo, hi);   // TOTK: storage-shared textures of this pool
+    if (hi > lo) dead_keep_drop_range(lo, hi);   // TOTK: finalized textures kept for their storage
 }
 
 static pidx_ent *pool_query(uintptr_t addr, uint64_t len) { // caller holds g_mu
@@ -2211,7 +2213,7 @@ static int pkg_final_cache_on(void) {
     if (v < 0) { const char *e = getenv("TOTK_PKG_FINAL_CACHE"); v = e && atoi(e); atomic_store(&g_pkg_final_cache, v); }
     return v;
 }
-@interface NvPkg : NSObject { @public id<MTLTexture> tex; uint64_t stamp, seen, hash, owned_gen; int tracked, owned, hashed; reup_key key; uint64_t chash, csub, used; uintptr_t lo, hi; } @end   // lo / hi (TOTK): the texture's memory (pkg_orphan_report)   // tracked (TOTK): result of the last nvn_dirty_tracked   // hash：DM_NVN_DIRTYCHECK 时上传内容的全量哈希 | hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK
+@interface NvPkg : NSObject { @public id<MTLTexture> tex; uint64_t stamp, seen, hash, owned_gen; int tracked, owned, hashed, dead_kept; reup_key key; uint64_t chash, csub, used; uintptr_t lo, hi; } @end   // lo / hi (TOTK): the texture's memory (pkg_orphan_report)   // tracked (TOTK): result of the last nvn_dirty_tracked   // hash：DM_NVN_DIRTYCHECK 时上传内容的全量哈希 | hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK
 /* TOTK: a mirrored texture the GPU starts rendering into is told directly (g_smu held), so tex_mtl no longer asks the owned
    set again every time any other serial joins it (a locked lookup per CPU-pool texture per new render target). */
 static void pkg_owned_locked(uint64_t k) { id o = hm_get_id(&g_by_serial, &k); if ([o isKindOfClass:[NvPkg class]]) ((NvPkg *)o)->owned = 1; }
@@ -2220,10 +2222,41 @@ static void pkg_owned_locked(uint64_t k) { id o = hm_get_id(&g_by_serial, &k); i
     // The wrapper is released after its GPU readers finish. Recycle its allocation
     // with the same descriptor key as a re-upload, retaining residency. The next
     // owner overwrites every mip/layer; cached views are retired by the normal path.
+    if (dead_kept) return;   // the texture lives on in g_dead_keep, which keeps it resident
     if (!owned && pkg_final_cache_on() && reup_offer(tex, &key)) atomic_fetch_add(&g_pkg_final_kept, 1);
     else res_remove(tex);
 }
 @end
+/* TOTK (2026-10-19, BotW save pictures): the game finalizes the 854x480 capture texture after the first save, yet every later
+   save renders into it and samples it again through its texture-pool slot. Each use of a finalized serial created a texture
+   from the pool bytes and deleted it after the submission, so the render and the thumbnail drawn two frames later saw two
+   different textures, and the thumbnail read the pool bytes the GPU never wrote: a black picture. On hardware both read the
+   same memory. A texture the GPU has rendered into is now kept per storage (memory, size, layout) when its serial is
+   finalized (or when a finalized serial renders into a fresh one) and handed to the next use of a finalized serial with the
+   same storage; the entry goes when its memory pool is finalized. */
+@interface NvKeep : NSObject { @public id<MTLTexture> tex; } @end
+@implementation NvKeep
+- (void)dealloc { res_remove(tex); }
+@end
+static nvn_hmap g_dead_keep = {.klen = sizeof(stor_key)};   // stor_key -> CFBridgingRetain'ed NvKeep (g_smu)
+static id<MTLTexture> dead_keep_get(const stor_key *k) {
+    pthread_mutex_lock(&g_smu); void *v = nvn_hm_get(&g_dead_keep, k); id<MTLTexture> t = v ? ((__bridge NvKeep *)v)->tex : nil; pthread_mutex_unlock(&g_smu);
+    return t;
+}
+static void dead_keep_put(const stor_key *k, id<MTLTexture> t) {
+    NvKeep *n = [NvKeep new]; n->tex = t;
+    pthread_mutex_lock(&g_smu); void *old = nvn_hm_get(&g_dead_keep, k); nvn_hm_put(&g_dead_keep, k, (void *)CFBridgingRetain(n)); pthread_mutex_unlock(&g_smu);
+    if (old) defer_obj_release(CFBridgingRelease(old));
+}
+static void dead_keep_drop_range(uintptr_t lo, uintptr_t hi) {
+    for (;;) { stor_key k; void *v = NULL;
+        pthread_mutex_lock(&g_smu);
+        for (uint32_t i = 0; i < g_dead_keep.cap && !v; i++) if (g_dead_keep.vals[i]) { const stor_key *sk = (const stor_key *)(g_dead_keep.keys + (size_t)i * g_dead_keep.klen); if (sk->mem >= lo && sk->mem < hi) { k = *sk; v = g_dead_keep.vals[i]; } }
+        if (v) nvn_hm_del(&g_dead_keep, &k);
+        pthread_mutex_unlock(&g_smu);
+        if (!v) return;
+        defer_obj_release(CFBridgingRelease(v)); }
+}
 /* TOTK: GPU renderings into CPU-visible memory pools reach that memory when the CPU invalidates it.
    On hardware the GPU writes the texture's memory, and the game reads it back with the CPU after
    nvnMemoryPoolInvalidateMappedRange (CPU-cached pools). Here a mirrored texture the GPU renders into keeps the result
@@ -3362,8 +3395,12 @@ static id<MTLTexture> tex_mtl(const tex_t *ct) {
         TILELOG(t, "first upload from the pool bytes");
         NvPkg *npk = [NvPkg new]; pk = npk;
         pk->lo = (uintptr_t)t->mem; pk->hi = pk->lo + t->L.size;
-        pk->tex = pkg_upload(t, &pk->stamp, &pk->key);
+        stor_key dk; int dkeep = serial_is_dead(t->serial) && gpu_owned(t->serial) && stor_key_of(t, &dk);   // a finalized serial the GPU rendered into: see g_dead_keep
+        id<MTLTexture> kept = dkeep ? dead_keep_get(&dk) : nil;
+        if (kept) { pk->tex = kept; pk->stamp = nvn_dirty_now(); static uint64_t n; if (++n <= 4) MLOG("finalized serial %llu reuses the texture kept for its storage (%ux%u, %llu so far)", (unsigned long long)t->serial, t->d.width, t->d.height, (unsigned long long)n); }
+        else pk->tex = pkg_upload(t, &pk->stamp, &pk->key);
         if (!pk->tex) return nil;
+        if (dkeep) { if (!kept) dead_keep_put(&dk, pk->tex); pk->dead_kept = 1; }
         pk->seen = nvn_dirty_now(); g_pkg_uploads++; if (dirtycheck()) pk->hash = full_hash(t->mem, t->L.size);
         serial_put(t->serial, pk);
         pk->owned = gpu_owned(t->serial);   // after it is in the table: a later mark finds it there (pkg_owned_locked)
@@ -3446,6 +3483,8 @@ void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = g_pkg_up
 uint64_t mtl_pkg_miss(void) { return g_pkg_miss; }
 void mtl_tex_release(tex_t *t) {
     if (!t->serial) return;
+    { stor_key k; __unsafe_unretained id o = serial_get(t->serial);   // a mirrored texture the GPU rendered into keeps its content for later uses of this storage (g_dead_keep)
+      if ([o isKindOfClass:[NvPkg class]] && ((NvPkg *)o)->owned && ((NvPkg *)o)->tex && stor_key_of(t, &k)) { NvPkg *pk = o; if (!pk->dead_kept) dead_keep_put(&k, pk->tex); pk->dead_kept = 1; } }
     serial_del(t->serial);
     pthread_mutex_lock(&g_smu); nvn_hm_put(&g_dead_serial, &t->serial, (void *)1); ser_bump_locked(t->serial); pthread_mutex_unlock(&g_smu);   // view caches of this serial look again (dead-serial follow)
     treg_drop_serial(t->serial);
