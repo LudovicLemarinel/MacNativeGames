@@ -502,8 +502,8 @@ def step_update_data(tree, game, update, keys, logs, *, version='v112'):
     expected = VERSIONS[version]
     folder = tree/f'extracted/{version}/romfs'
     index = folder/'index.json'
-    # BOTW 1.9.0: no merged image is recorded yet (the first examined base dump was damaged, docs/botw-port.md). Until
-    # then a merge passes on its six verified IVFC levels alone, and its hash is printed to be recorded.
+    # A new version without a recorded merged image passes on its six verified IVFC levels alone, and its hash is
+    # printed to be recorded in its expected-v<version>.json.
     recorded = expected.get('romfs')
     valid = False
     if index.is_file() and (folder/'romfs.bin').is_file():

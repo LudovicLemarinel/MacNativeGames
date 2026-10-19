@@ -1,5 +1,5 @@
 {
-  "_comment": "BOTW 1.9.0 code bytes and verified rewrite. sdk, subsdk0 and rtld are byte-identical to TOTK 1.4.3 (NintendoSDK 20.5.22), and so are their rewrites. The merged RomFS is not recorded yet. No runtime, gameplay or graphics validation has been done.",
+  "_comment": "BOTW 1.9.0 code bytes, verified rewrite and merged base + 1.9.0 RomFS. sdk, subsdk0 and rtld are byte-identical to TOTK 1.4.3 (NintendoSDK 20.5.22), and so are their rewrites. No runtime, gameplay or graphics validation has been done.",
   "title_id": "01007EF00011E000",
   "update_title_id": "01007EF00011E800",
   "version": 1114112,
@@ -16,6 +16,10 @@
     "main.patched.bin": "6d48bff1b7f2692bd4f2efd3316b564877c50a10c6145610cf9a779b220538c6",
     "sdk.patched.bin": "4d625d9baaebe60d38a00de1b8023fde7fb856d460a08433809670179483ca24",
     "subsdk0.patched.bin": "0322958960fb205a8e108476f9e6b344e90cd5526f3e2c83503b3261ff2518e2"
+  },
+  "romfs": {
+    "size": 15132662100,
+    "sha256": "826b373b80cea5c581749a09dfbd9bb21e8d7a9cd3ed161c4d5315b9ae429dad"
   },
   "base_exefs_sha256": {
     "_comment": "Base game 1.0.0 (NintendoSDK 0.12.14, six modules, NVN in subsdk0). Required for the RomFS merge only; its code is not a port target.",

@@ -8,13 +8,13 @@ python3.14 build_app.py --game botw "<BOTW base 1.0.0>.nsp" --update "<BOTW 1.9.
     -k <prod.keys> --firmware <unpacked firmware NCA directory>
 ```
 
-**The merged RomFS hash is not recorded yet.** The first base NSP examined (2026-10-19) is damaged: its Program NCA
-`861707001401bbce36c7e421efac76d4` hashes to `636e0d6f…` instead of its content ID, and hactool's IVFC check of the
-base NCA alone fails at 12 blocks of level 5 (RomFS offsets `0xfe7c0000`–`0xfe7d4000`, `0x202288000`–`0x20229c000`,
-`0x202474000`–`0x20247c000`). The merge with 1.9.0 fails at exactly those blocks, all read from base-sourced BKTR
-relocations, so the BKTR path itself is not in question. The base ExeFS passed its own hash table, and the update's
-NCAs all match their content IDs. Until a sound base dump is merged, the build accepts a merge on its six verified IVFC
-levels and prints the SHA-256 to record in `expected-v1.9.0.json`.
+Merged RomFS (2026-10-19, M4): 15,132,662,100 bytes, SHA-256 `826b373b…ae429dad`, all six IVFC levels verified, about
+two minutes. Its 41,062 files are indexed for the runtime (`extracted/v190/romfs/runtime-index.bin`).
+
+A damaged base dump fails this step. One examined earlier had a Program NCA (`861707001401bbce36c7e421efac76d4`)
+hashing to `636e0d6f…` instead of its content ID; hactool's IVFC check of that NCA alone failed at 12 level-5 blocks,
+and the merge failed at exactly those blocks, all read from base-sourced BKTR relocations. A fresh dump of the same
+base merged cleanly. To check a dump quickly, hash each NCA in the NSP: the first 16 bytes of its SHA-256 are its name.
 
 The work folder defaults to `BOTW_build` next to the base game. The base game's ExeFS is checked against its known
 hashes but not rewritten; base + 1.9.0 are merged through BKTR (the pinned hactool path used for TOTK updates), all six
