@@ -2126,6 +2126,7 @@ static int g_paced_hz;   // the display-following rate, used instead of UNCAPPED
 /* TOTK: frame interpolation at 30 fps or at half the refresh rate paces the game itself, so it suspends the uncapped mode;
    the uncapped interpolation mode keeps it. Key 2 cycles the modes at run time (2026-10-16 night). */
 int runtime_frame_step_realtime(void);
+int runtime_frame_max_hz(void);
 /* Interpolation mode as far as pacing goes. A game whose time advances by its own present interval (no real-time frame
    step: BOTW) must keep that interval, so 30+30 and half-refresh, which hold the game at a fixed rate, pace like the
    interval-following mode instead: the game's own frames, one interpolated frame between each pair. */
@@ -2181,6 +2182,14 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
            (at = interval / 60 s); the display still shows each picture at its next refresh. */
         if (mtl_link_active() && !uncapped_now() && !mfx_own_clock() && runtime_frame_step_realtime() != 0) { if (!mtl_link_wait_tick(period ? 2 * period : 33333333ull, present_ticks(o), period) && wait) sleep_until_ns(at); }   // DM_PRESENT_LINK：节拍完全跟显示节拍（跑得快就等下一拍，落后立刻走）；自己的 60 Hz 时钟只作等不到节拍时的兜底 | DM_PRESENT_LINK: pacing fully follows the display link (wait for the next display-link tick when running fast, go immediately when behind); our own 60 Hz clock is only the fallback when no display-link tick arrives
         else if (wait) sleep_until_ns(at);
+        /* A game whose menus count 60 Hz frames (BOTW: its real-time step is ours and covers the world, not the UI)
+           never runs above runtime_frame_max_hz() / interval, whatever the display or the pacing mode allows: on a
+           120 Hz display its title and in-game menus ran far too fast (2026-10-19). */
+        static uint64_t cap_last; int cap = runtime_frame_max_hz();
+        if (cap > 0) {
+            uint64_t next = cap_last + (uint64_t)(o->interval > 1 ? o->interval : 1) * 1000000000ull / (uint64_t)cap, t = now_ns();
+            if (cap_last && t < next) { sleep_until_ns(next); cap_last = next; } else cap_last = t;
+        }
     } else {   // DM_DETCLOCK_PACE=1（画面闸门用）：客体时钟按帧走的同时，每帧墙钟不短于一个步长——帧数与游戏内时间确定，后台加载线程每帧至少有一个步长的墙钟可用； | DM_DETCLOCK_PACE=1 (used by the screenshot gate): while the guest clock advances per frame, each frame's wall clock is no shorter than one step -- frame count and in-game time are deterministic, and the background loading thread has at least one step of wall clock available per frame;
                // 机器满载时帧只会更慢、后台得到的墙钟只会更多，所以「消息后第 N 帧」截到的画面与负载无关
                // When the machine is fully loaded frames only get slower and the background only gets more wall clock, so the picture captured at "the Nth frame after the message" is independent of load
@@ -2460,6 +2469,7 @@ void nvn_present_config(int hz, int display_mode) { g_hz = g_paced_hz = hz; g_di
    step per frame (BOTW, unpatched), so it must be paced as on the console: 60 Hz ticks and the game's own interval;
    uncapped or display-rate pacing would run it fast. The weak default (-1) keeps TOTK_REALTIME in charge. */
 __attribute__((weak)) int runtime_frame_step_realtime(void) { return -1; }
+__attribute__((weak)) int runtime_frame_max_hz(void) { return 0; }   /* the game's own cap on game frames a second, 0 = none */
 static void present_cfg(const win_t *o) {
     if (g_hz >= 0) return;
     // 有窗口仍缺省 display 间隔模式；无窗口缺省 game 模式。环境变量可覆盖固定 60 Hz。
