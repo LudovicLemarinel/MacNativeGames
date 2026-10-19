@@ -2133,6 +2133,8 @@ static int pacing_mfx(void) { int m = mfx_enabled(); return m && runtime_frame_s
 static int uncapped_now(void) { int m = pacing_mfx(); return g_uncapped && (m == MFX_OFF || m == MFX_MAX); }
 /* 30+30 on a display whose rate is not a multiple of 30 (the user's 100 Hz): the game is paced by our own clock at exactly
    30 fps instead of by the display link (3 refreshes would be 33 fps); the display link still shows each picture at a refresh. */
+/* For the FPS overlay: key 2's mode, and the mode the pacing follows and whether it is uncapped right now. */
+int dm_pacing_overlay(int *paced, int *uncapped) { *paced = pacing_mfx(); *uncapped = uncapped_now(); return mfx_enabled(); }
 static int mfx_own_clock(void) { return pacing_mfx() == MFX_30 && (g_paced_hz <= 0 || g_paced_hz % 30); }
 /* Opt-in until live scene/clock validation. Only applies to the existing Mac
    real-time uncapped path; original timing, MetalFX and deterministic tests
