@@ -246,7 +246,14 @@ FITS(totk_buffer_builder,NVNbufferBuilder);FITS(totk_buffer,NVNbuffer);
 NVN(nvnBufferBuilderSetDevice, void, NVNbufferBuilder *b,NVNdevice *d){((totk_buffer_builder *)b)->dev=d;}
 NVN(nvnBufferBuilderSetDefaults, void, NVNbufferBuilder *b){NVNdevice *d=((totk_buffer_builder *)b)->dev;memset(b,0,sizeof(totk_buffer_builder));((totk_buffer_builder *)b)->dev=d;}
 NVN(nvnBufferBuilderSetStorage, void, NVNbufferBuilder *b,NVNmemoryPool *p,ptrdiff_t off,size_t size){totk_buffer_builder *v=(void *)b;v->pool=(void *)p;v->off=off;v->size=size;}
-NVN(nvnBufferInitialize, NVNboolean, NVNbuffer *b,const NVNbufferBuilder *builder){const totk_buffer_builder *v=(const void *)builder;if(!v->pool||v->pool->magic!=MAGIC('P','O','O','L')||v->off<0||(uint64_t)v->off>v->pool->size||v->size>v->pool->size-(uint64_t)v->off)return 0;*(totk_buffer *)b=(totk_buffer){MAGIC('B','U','F',0),v->pool,v->off,v->size};return 1;}
+/* A buffer may extend past the end of its pool: NVN accepts it, and BOTW's save picture asks for a 0x40000-byte buffer on
+   the 0x24000-byte pool it reads the 256x144 picture back from (refused here, the game used the uninitialised buffer and
+   its saves got a black picture; 2026-10-19). Its size is cut to the pool's end; the pool and offset must be valid. */
+NVN(nvnBufferInitialize, NVNboolean, NVNbuffer *b,const NVNbufferBuilder *builder){const totk_buffer_builder *v=(const void *)builder;
+    if(!v->pool||v->pool->magic!=MAGIC('P','O','O','L')||v->off<0||(uint64_t)v->off>v->pool->size)return 0;
+    uint64_t size=v->size;
+    if(size>v->pool->size-(uint64_t)v->off){ static int n; if(++n<=4) LOG("[nvn] BufferInitialize: buffer of %#llx bytes at %#llx past the end of its %#llx-byte pool, cut to the pool", (unsigned long long)size, (unsigned long long)v->off, (unsigned long long)v->pool->size); size=v->pool->size-(uint64_t)v->off; }
+    *(totk_buffer *)b=(totk_buffer){MAGIC('B','U','F',0),v->pool,v->off,size};return 1;}
 NVN(nvnBufferFinalize, void, NVNbuffer *b){memset(b,0,sizeof(totk_buffer));}
 NVN(nvnBufferMap, void *, const NVNbuffer *b){const totk_buffer *v=(const void *)b;return v->pool&&v->pool->mem?v->pool->mem+v->off:NULL;}
 NVN(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *b){return (uintptr_t)h_nvnBufferMap(b);}
