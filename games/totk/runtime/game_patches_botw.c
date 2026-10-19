@@ -139,7 +139,17 @@ static void patch_output_res(Module *m) {
 }
 uint64_t runtime_output_res_extra_bytes(void) { return 0; }
 int runtime_output_res_toggle(void) { return 0; }
-int runtime_output_mode_cycle(void) { return 0; }
+/* Key 3: MetalFX upscaling of the finished picture to the window (full screen or a large window shows the 1920x1080
+   picture bigger; MetalFX instead of the bilinear stretch). The host's output stage (nvn_mtl.m output_upscale) is
+   game-independent; TOTK's other stage (its own upscale shader replaced by MetalFX) does not apply to BOTW. The scene
+   resolution is a launch setting (TOTK_SCENE_WIDTH): BOTW sizes its scene targets when the display mode is applied. */
+int runtime_output_mode_cycle(void) {
+    extern int mfxup_output_enabled(void), mfxup_enabled(void); extern void dm_gfx_set_flag(const char *, int);
+    int on = !(mfxup_enabled() && mfxup_output_enabled());
+    dm_gfx_set_flag("mfx_upscale", on); dm_gfx_set_flag("mfx_output", on);
+    fprintf(stderr, "[totk] key 3: MetalFX output upscaling %s\n", on ? "on" : "off");
+    return 1;
+}
 
 /* 60 FPS, dynamic. BOTW's adaptive present-interval controller (framework frame loop main+0x112660c, controller object
    at framework+0x228) turns the measured frame work time (+0x250, in ticks) into 60 Hz frames, adds 1 (2 above a 0.9
