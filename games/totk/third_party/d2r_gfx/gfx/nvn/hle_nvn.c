@@ -2445,13 +2445,17 @@ static int uncapped_cap(int scr) {
     return v < 30 ? 30 : v > UNCAPPED_HZ ? UNCAPPED_HZ : v;
 }
 void nvn_present_config(int hz, int display_mode) { g_hz = g_paced_hz = hz; g_display_mode = display_mode; }
+/* The game patches say whether game time follows real time (TOTK's real-time frame step). 0: the game advances a fixed
+   step per frame (BOTW, unpatched), so it must be paced as on the console: 60 Hz ticks and the game's own interval;
+   uncapped or display-rate pacing would run it fast. The weak default (-1) keeps TOTK_REALTIME in charge. */
+__attribute__((weak)) int runtime_frame_step_realtime(void) { return -1; }
 static void present_cfg(const win_t *o) {
     if (g_hz >= 0) return;
     // 有窗口仍缺省 display 间隔模式；无窗口缺省 game 模式。环境变量可覆盖固定 60 Hz。
     // With a window the default is still display interval mode; without a window the default is game mode. Environment variables can override the fixed 60 Hz.
     int scr = mtl_display_hz();
     const char *e = getenv("DM_PRESENT_HZ"), *rt = getenv("TOTK_REALTIME");
-    int realtime = !(rt && !strcmp(rt, "0"));
+    int realtime = !(rt && !strcmp(rt, "0")) && runtime_frame_step_realtime() != 0;
     g_hz = g_paced_hz = e ? atoi(e) : (realtime && scr > 0 ? scr : 60);
     { const char *u = getenv("TOTK_UNCAPPED"), *f60 = getenv("TOTK_FPS60");   // the original 30-frame mode needs fixed pacing; MetalFX interpolation suspends it while on (uncapped_now)
       g_uncapped = !e && realtime && !(u && !strcmp(u, "0")) && !(f60 && !strcmp(f60, "0")) && g_hz < UNCAPPED_HZ; }

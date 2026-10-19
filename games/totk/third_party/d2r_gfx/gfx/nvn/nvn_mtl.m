@@ -4160,6 +4160,41 @@ static void mfx_snapshot_scene(void) {
     enc_b_end(g_blit); g_blit = nil;
     g_mfx.scene_done = 1; mfx_note_scene();
 }
+/* BOTW binds one texture at two colour targets of a pass (G-buffer albedo at c1 and, write-masked off, at c2). On NVN
+   that alias is harmless; on Apple's tile GPUs each attachment has its own tile storage and both are stored at the end
+   of the pass, so the never-written one overwrites the other tile by tile (black surfaces with random squares). Keep
+   one real attachment, the one the opening draw writes (else the first), and give the other a scratch texture of the
+   same format and size that is neither loaded nor stored. Pipelines are unchanged: the formats match. */
+static uint32_t cur_chmask(void);
+static void alias_attachments(MTL4RenderPassDescriptor *pd) {
+    static id<MTLTexture> scratch[8];
+    uint32_t mask = cur_chmask();
+    for (int j = 1; j < 8; j++) {
+        MTLRenderPassColorAttachmentDescriptor *b = pd.colorAttachments[j]; if (!b.texture) continue;
+        id<MTLTexture> rb = b.texture.parentTexture ?: b.texture;
+        for (int i = 0; i < j; i++) {
+            MTLRenderPassColorAttachmentDescriptor *a = pd.colorAttachments[i]; if (!a.texture) continue;
+            id<MTLTexture> ra = a.texture.parentTexture ?: a.texture;
+            if (ra != rb || a.level != b.level || a.slice != b.slice || a.depthPlane != b.depthPlane) continue;
+            int drop = (mask >> (4 * j) & 0xf) && !(mask >> (4 * i) & 0xf) ? i : j;
+            MTLRenderPassColorAttachmentDescriptor *d = pd.colorAttachments[drop];
+            NSUInteger w = MAX(d.texture.width >> d.level, 1u), h = MAX(d.texture.height >> d.level, 1u);
+            id<MTLTexture> s = scratch[drop];
+            if (!s || s.pixelFormat != d.texture.pixelFormat || s.width != w || s.height != h) {
+                MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:d.texture.pixelFormat width:w height:h mipmapped:NO];
+                td.storageMode = MTLStorageModePrivate; td.usage = MTLTextureUsageRenderTarget;
+                id<MTLTexture> n = [g_dev newTextureWithDescriptor:td];
+                if (!n) { RED_ONCE(100, "别名附件替身贴图建不出 %lux%lu 格式 %lu", (unsigned long)w, (unsigned long)h, (unsigned long)d.texture.pixelFormat); return; }
+                res_add(n); if (s) defer_obj_release(s); scratch[drop] = s = n;
+                static int logged; if (!logged++) MLOG("[alias] colour targets %d and %d are the same texture (%lux%lu format %lu): c%d gets a scratch texture", i, j, (unsigned long)w, (unsigned long)h, (unsigned long)d.texture.pixelFormat, drop);
+            }
+            d.texture = s; d.level = 0; d.slice = 0; d.depthPlane = 0;
+            d.loadAction = MTLLoadActionDontCare; d.storeAction = MTLStoreActionDontCare;
+            PD("A %llu c%d 与 c%d 同一张贴图：c%d 换替身", g_stat_pass + 1, i, j, drop);
+            break;
+        }
+    }
+}
 static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only);
 static id<MTL4RenderCommandEncoder> rp_begin(void) { return rp_begin_ex(0); }
 static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
@@ -4220,6 +4255,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
             if (xe && (xe->state == XV_INVALID || xe->state == XV_PROBE)) { if (pd.colorAttachments[i].loadAction == MTLLoadActionLoad) { xv_ent copy = *xe; xv_violation(&copy, "作附件读入旧内容"); } else xv_good(xe); } }
         pd.colorAttachments[i].storeAction = MTLStoreActionStore;
     }
+    alias_attachments(pd);
     // clear_only：0 全挂 1 只为清除 2 深度模板都不挂 3 只挂模板 4 只挂深度（3 / 4 由 pass_ds_need 前瞻证明整通道只用那一项）
     // clear_only: 0 attach all 1 only for clears 2 neither depth nor stencil attached 3 stencil only 4 depth only (3 / 4: the pass_ds_need lookahead proves the whole pass uses only that one)
     if (R.rt.depth && clear_only == 3) {   // 只挂模板：合一格式的深度平面不进 tile、不读不写（Metal 允许深度附件空、模板附件挂合一贴图） | Stencil only: the depth plane of the combined format does not enter the tile and is neither read nor written (Metal allows an empty depth attachment with the combined texture on the stencil attachment)
@@ -5281,6 +5317,7 @@ static struct {
     p_poly_offset po; float vp[16][4]; float dr[2]; int has_vp; int depth_clamp; int render_disabled; int raster_discard;
     float blend_color[4]; int64_t copy_stride;
 } S;
+static uint32_t cur_chmask(void) { return S.chmask.mask; }
 static void udc_note_draw(NvProg *pr) {
     if (R.has_rt) for (int i = 0; i < R.rt.n && i < 8; i++) if (R.rt.color[i]) { zskip_del(R.rt.color[i]->serial); g_zskip_cand_ok[i] = 0; }   // 零源集合：真画了就不再是全零 | Zero-source set: once really drawn it is no longer all zeros
     /* TOTK (after D2R Mobile 44a6770): the program's image bindings and fragment colour mask are worked out once per program
