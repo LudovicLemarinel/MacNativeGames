@@ -4124,7 +4124,7 @@ static void mfx_pass_setup(MTL4RenderPassDescriptor *pd) {
         if (to_swap) {
             if (g_mfx.last_c0 && g_mfx.canvas != g_mfx.last_c0) { g_mfx.canvas = g_mfx.last_c0; MLOG("[mfx] canvas: texture %llu (%ux%u), copied to presented texture %llu", (unsigned long long)g_mfx.canvas, g_mfx.swap_w, g_mfx.swap_h, (unsigned long long)t0->serial); }
         } else if (c0.width >= 640 && fabs((double)c0.width * g_mfx.swap_h / ((double)c0.height * g_mfx.swap_w) - 1) < 0.01 && pd.colorAttachments[0].level == 0 &&
-                   pf_is_float(c0.pixelFormat) && !pd.depthAttachment.texture)
+                   (pf_is_float(c0.pixelFormat) || c0.pixelFormat == MTLPixelFormatRGB10A2Unorm) && !pd.depthAttachment.texture)   // BOTW composes in RGB10A2
             g_mfx.last_c0 = t0->serial;
     }
     id<MTLTexture> dt = pd.depthAttachment.texture;
@@ -4143,7 +4143,8 @@ static void mfx_pass_setup(MTL4RenderPassDescriptor *pd) {
 /* TOTK_MFX: vertex shaders of the game's UI (layout panes, text, icons, the minimap); the first draw into the canvas with
    one of them ends the scene. */
 static int mfx_ui_vs(const char *key) {
-    static const char *const ui[] = {"7f2113e2", "e9fd7b43", "a662e313", "16684efc", "3e11cee5", "48c18ae6", "35cbc686", "4872bec9", "9f47ed90"};
+    static const char *const ui[] = {"7f2113e2", "e9fd7b43", "a662e313", "16684efc", "3e11cee5", "48c18ae6", "35cbc686", "4872bec9", "9f47ed90",
+                                     "eaf96f5d", "e73cda77", "23079d53", "a983fef9", "92b09e2c"};   // the last five: BOTW 1.9.0 (Ui2d)
     for (size_t i = 0; i < sizeof ui / sizeof *ui; i++) if (!strncmp(key, ui[i], 8)) return 1;
     return 0;
 }
@@ -8505,11 +8506,13 @@ static void prepare_draw_textures(NvProg *pr) {
     }
 }
 /* TOTK_MFX: the camera of the G-buffer pass, from its first draw: vertex uniform 1, the 2368-byte block (view, view-projection,
-   projection, inverse view, near / far, aspect, field of view; floats 84..167 hold the camera of two frames earlier). */
+   projection, inverse view, near / far, aspect, field of view; floats 84..167 hold the camera of two frames earlier).
+   BOTW 1.9.0 has the same layout in a 2336-byte block at vertex uniform 0. */
 static void mfx_take_camera(void) {
     g_mfx.want_cam = 0;
     const p_bind_buf *u = &S.ubo[0][1]; float cam[84];
-    if (u->addr && u->size == 2368) {
+    if (!(u->addr && u->size == 2368) && S.ubo[0][0].addr && S.ubo[0][0].size == 2336) u = &S.ubo[0][0];
+    if (u->addr && (u->size == 2368 || u->size == 2336)) {
         pend_materialize(u->addr, (uint8_t *)cam, sizeof cam, 0);   // the bytes this draw sees: memory plus pending inline updates
         mfx_note_camera(cam, 84);
         /* TOTK_MFX_CAMLOG=<first>-<last frame>: every captured camera (diagnostic) */
