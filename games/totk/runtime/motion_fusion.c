@@ -105,20 +105,30 @@ void runtime_motion_feed(const double raw_acc[3], const double raw_gyro[3], uint
     double dt = last_ns && now > last_ns ? (now - last_ns) / 1e9 : 0.004;
     if (dt > 0.05) dt = 0.004;   /* a gap (sensors were off, the app was in the background): no integration across it */
     last_ns = now; live = 1;
+    /* The console's sensor delivers a state every 5 ms and a game may count its new states as 5 ms each (BOTW's
+       horizontal aim came out halved with 100 samples a second and nearly nil with 33), so a longer step is split into
+       5 ms states with the same rate; TOTK_GYRO_SPLIT=0 keeps one state per sample. */
+    static int split = -1; if (split < 0) { const char *e = getenv("TOTK_GYRO_SPLIT"); split = !(e && !strcmp(e, "0")); }
+    int parts = 1, fresh = restart;
     if (restart) { align_to(acc); memset(angle, 0, sizeof angle); restart = 0; }
-    else integrate(gyro, acc, dt);
-    RuntimeMotionState *s = &ring[produced % MOTION_RING];
-    *s = (RuntimeMotionState){.sampling = produced + 1, .delta_ns = (uint64_t)(dt * 1e9)};
-    for (int i = 0; i < 3; i++) {
-        double rps = gyro[i] / (2 * M_PI); angle[i] += rps * dt;
-        s->acc[i] = (float)acc[i]; s->gyro[i] = (float)rps; s->angle[i] = (float)angle[i];
-        for (int j = 0; j < 3; j++) s->dir[i * 3 + j] = (float)R[j][i];   /* direction i = controller axis i in the reference frame */
+    else if (split) { parts = (int)lround(dt / 0.005); if (parts < 1) parts = 1; if (parts > 10) parts = 10; }
+    double step = dt / parts;
+    RuntimeMotionState *s = NULL;
+    for (int k = 0; k < parts; k++) {
+        if (!fresh) integrate(gyro, acc, step);
+        s = &ring[produced % MOTION_RING];
+        *s = (RuntimeMotionState){.sampling = produced + 1, .delta_ns = (uint64_t)(step * 1e9)};
+        for (int i = 0; i < 3; i++) {
+            double rps = gyro[i] / (2 * M_PI); angle[i] += rps * step;
+            s->acc[i] = (float)acc[i]; s->gyro[i] = (float)rps; s->angle[i] = (float)angle[i];
+            for (int j = 0; j < 3; j++) s->dir[i * 3 + j] = (float)R[j][i];   /* direction i = controller axis i in the reference frame */
+        }
+        produced++;
     }
-    produced++;
     if (!log_at) log_at = now;
     if (now - log_at >= 30000000000ull) {
         uint64_t values, reads; runtime_hid_feedback_stats(&values, &reads);
-        fprintf(stderr, "[gyro] last 30 s: %llu samples (%.0f a second), the game read the states %llu times; now acc (%+.2f %+.2f %+.2f) G, gyro (%+.3f %+.3f %+.3f) rev/s\n",
+        fprintf(stderr, "[gyro] last 30 s: %llu states (%.0f a second), the game read the states %llu times; now acc (%+.2f %+.2f %+.2f) G, gyro (%+.3f %+.3f %+.3f) rev/s\n",
                 (unsigned long long)(produced - logged), (produced - logged) / ((now - log_at) / 1e9), (unsigned long long)(reads - reads_logged),
                 s->acc[0], s->acc[1], s->acc[2], s->gyro[0], s->gyro[1], s->gyro[2]);
         logged = produced; reads_logged = reads; log_at = now;
