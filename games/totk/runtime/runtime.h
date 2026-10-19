@@ -98,6 +98,10 @@ void *runtime_front_override(const char *name);
 int runtime_front_focus(void);
 void runtime_shortcut_help_toggle(void);
 int fps_overlay_toggle_hints(void);   /* shared key 1 toggle for FPS, shader and system-load overlays */
+void runtime_fps_only_toggle(void);   /* key 4: the FPS line alone (frontend.m) */
+int fps_overlay_hints_enabled(void);
+int fps_overlay_fps_only(void);
+int fps_overlay_toggle_fps_only(void);
 
 void *runtime_account_override(const char *name);
 

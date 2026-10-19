@@ -16,6 +16,8 @@ void hle_bind_system_event(void *event,int autoclear){(void)event;(void)autoclea
 void hle_signal_system_event(void *event){(void)event;}
 uint64_t dm_nvn_frame_count(void){return 0;}
 int fps_overlay_toggle_hints(void){return 0;}
+int fps_overlay_toggle_fps_only(void){return 0;}
+int fps_overlay_hints_enabled(void){return 1;}
 
 static NSEvent *key(NSEventModifierFlags flags){
  return [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:flags timestamp:0

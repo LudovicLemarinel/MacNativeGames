@@ -37,9 +37,15 @@ static const Glyph FONT[] = {
     {' ', {0, 0, 0, 0, 0, 0, 0}},
 };
 
-static _Atomic int g_hints_visible = 1;
+static _Atomic int g_hints_visible = 1, g_fps_only;
 int fps_overlay_hints_enabled(void) { return atomic_load_explicit(&g_hints_visible, memory_order_relaxed); }
-int fps_overlay_toggle_hints(void) { return !atomic_fetch_xor_explicit(&g_hints_visible, 1, memory_order_relaxed); }
+int fps_overlay_fps_only(void) { return atomic_load_explicit(&g_fps_only, memory_order_relaxed); }
+/* Key 1 out of the FPS-only mode shows every layer again instead of toggling them. */
+int fps_overlay_toggle_hints(void) {
+    if (atomic_exchange_explicit(&g_fps_only, 0, memory_order_relaxed)) { atomic_store_explicit(&g_hints_visible, 1, memory_order_relaxed); return 1; }
+    return !atomic_fetch_xor_explicit(&g_hints_visible, 1, memory_order_relaxed);
+}
+int fps_overlay_toggle_fps_only(void) { return !atomic_fetch_xor_explicit(&g_fps_only, 1, memory_order_relaxed); }
 
 int fps_overlay_enabled(void) {
     static int on = -1;

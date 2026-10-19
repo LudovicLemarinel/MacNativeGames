@@ -15,7 +15,11 @@ typedef struct { int fps, screen_w, screen_h, mfx, gen, big; } fps_overlay_info;
 int fps_overlay_enabled(void);
 /* Shared user toggle for every in-picture HUD layer: FPS, shader collection and load telemetry. */
 int fps_overlay_hints_enabled(void);
-int fps_overlay_toggle_hints(void);   /* atomically toggles all HUD layers and returns the new visibility */
+int fps_overlay_toggle_hints(void);   /* atomically toggles all HUD layers and returns the new visibility; ends FPS-only */
+/* Key 4: FPS-only mode, the FPS line alone whatever key 1 says (the shader and load lines and the shortcut help hidden);
+   toggling it off goes back to what key 1 set. */
+int fps_overlay_fps_only(void);
+int fps_overlay_toggle_fps_only(void);   /* returns the new mode */
 /* Pixel scale (1..FPS_OVERLAY_MAX_SCALE) for a game picture view_h pixels tall: one text line is about 3% of its height. */
 int fps_overlay_scale(double view_h);
 /* The line in a 5x7 pixel font on a dark box, as BGRA8 pixels in out (FPS_OVERLAY_TEX_W x FPS_OVERLAY_TEX_H,
