@@ -29,7 +29,12 @@ static double angle[3];
 static int restart = 1, live;
 static int from[3] = {0, 1, 2};
 static double sign[3] = {1, 1, 1}, det = 1;
-static double deadzone = -1;   /* rad/s; -1 until read from TOTK_GYRO_DEADZONE */
+static double deadzone = -1;
+static double yaw_gain = -1;   /* the rotation about the vertical is multiplied by this; -1 until read from TOTK_GYRO_YAW */
+void runtime_motion_yaw_gain(int percent) {
+    pthread_mutex_lock(&lock); yaw_gain = percent / 100.0; pthread_mutex_unlock(&lock);
+    fprintf(stderr, "[gyro] horizontal gain %d %%\n", percent);
+}   /* rad/s; -1 until read from TOTK_GYRO_DEADZONE */
 
 /* TOTK_GYRO_AXES: reference axis i = sign * controller axis from[i]. 0 if unset, -1 if malformed. */
 int runtime_motion_axes(const char *spec) {
@@ -102,6 +107,20 @@ void runtime_motion_feed(const double raw_acc[3], const double raw_gyro[3], uint
     }
     double rate = norm3(gyro), keep = rate > deadzone ? (rate - deadzone) / rate : 0;
     for (int i = 0; i < 3; i++) gyro[i] *= keep;
+    /* Horizontal gain (2026-10-19): BOTW's horizontal motion aim stayed slow with the same states TOTK aims well with,
+       so the rotation about the vertical (the reference's up row of R, in controller coordinates) can be scaled:
+       TOTK_GYRO_YAW=<percent> (default 100), "flag gyro_yaw <percent>" while the game runs. Scaled before the
+       integration, so the orientation and the angles agree with the rate the game gets. */
+    if (yaw_gain < 0) {
+        const char *e = getenv("TOTK_GYRO_YAW"); int v = 100;
+        if (e) { char *end; long l = strtol(e, &end, 10); if (end == e || *end || l < 10 || l > 1000) runtime_fail("TOTK_GYRO_YAW must be a percentage in [10, 1000]"); v = (int)l; }
+        yaw_gain = v / 100.0;
+        if (e) fprintf(stderr, "[gyro] horizontal gain %d %% (TOTK_GYRO_YAW)\n", v);
+    }
+    if (yaw_gain != 1 && !restart) {
+        double up = gyro[0] * R[2][0] + gyro[1] * R[2][1] + gyro[2] * R[2][2];
+        for (int i = 0; i < 3; i++) gyro[i] += (yaw_gain - 1) * up * R[2][i];
+    }
     double dt = last_ns && now > last_ns ? (now - last_ns) / 1e9 : 0.004;
     if (dt > 0.05) dt = 0.004;   /* a gap (sensors were off, the app was in the background): no integration across it */
     last_ns = now; live = 1;
