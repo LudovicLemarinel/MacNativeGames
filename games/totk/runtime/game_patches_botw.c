@@ -158,13 +158,17 @@ int runtime_output_mode_cycle(void) {
    interval 1, so the game slows down whenever a frame takes longer than 16.7 ms. Here the controller is kept and its
    floor lowered from 2 to 1, as TOTK's 60 FPS patch does: 60 FPS when frames fit, 30 or 20 with correct game speed
    otherwise. Same controller in 1.6.0 at main+0x16148c0 (s11 = 1.0, s12 = 2.0, w20 = 2). TOTK_FPS60=0 leaves it as
-   shipped. */
+   shipped.
+   Its maximum (+0xc, read only here through main+0x1126cb8) is held at 2 (2026-10-19): key 2's 30+30 mode paces every
+   frame to 33.3 ms, which the controller reads as 1.99 frames -> 1 + 2 = interval 3, so menus fell to 20 FPS and
+   stayed there (19 FPS, slow response). With the real-time frame step an interval of 3 only costs frames. */
 static const Patch fps60[] = {
     {0x112670c, 0x1e204160, 0x1e204140, "floor: fmov s0, s10 (1.0; was s11 = 2.0)"},
     {0x1126748, 0x71000d1f, 0x7100091f, "raise path: cmp w8, #2 (was #3)"},
     {0x1126754, 0x1a98c109, 0x51000509, "raise path: sub w9, w8, #1 (was csel w9, w8, w24 = 3, gt)"},
     {0x112675c, 0x51000529, 0x1a9fc529, "raise path: csinc w9, w9, wzr, gt (next lower candidate floors at 1; was sub w9, w9, #1)"},
     {0x1126794, 0x71000d3f, 0x7100093f, "lower path: cmp w9, #2 (keep lowering down to 1; was #3)"},
+    {0x1126cb8, 0xb9400c00, 0x52800040, "maximum: mov w0, #2 (was ldr w0, [x0, #0xc] = 3)"},
 };
 
 /* Dynamic resolution off (the "Disable Dynamic Resolution" mod by theboy181 for 1.6.0, main+0x150aba4). The resolution
@@ -194,7 +198,9 @@ void runtime_game_patches(Module *m) {
         fprintf(stderr, "[totk] BOTW %s: shipping frame controller (TOTK_FPS60=0)\n", TOTK_GAME_VERSION);
         return;
     }
-    for (unsigned i = 0; i < sizeof fps60 / sizeof *fps60; i++) {
+    /* the maximum held at 2 (the last entry) only with the real-time frame step: without it the interval sets game speed */
+    unsigned n = sizeof fps60 / sizeof *fps60 - (frame_ratio ? 0 : 1);
+    for (unsigned i = 0; i < n; i++) {
         uint32_t word;
         if (fps60[i].off + 4 > m->text_end) runtime_fail("BOTW FPS patch outside text");
         memcpy(&word, m->base + fps60[i].off, 4);
@@ -203,7 +209,7 @@ void runtime_game_patches(Module *m) {
             runtime_fail("BOTW FPS patch original instruction mismatch");
         }
     }
-    for (unsigned i = 0; i < sizeof fps60 / sizeof *fps60; i++) memcpy(m->base + fps60[i].off, &fps60[i].replacement, 4);
-    fprintf(stderr, "[totk] BOTW %s 60 FPS: controller floor lowered to interval 1 (%zu verified instructions; TOTK_FPS60=0 restores 30 FPS)\n",
-            TOTK_GAME_VERSION, sizeof fps60 / sizeof *fps60);
+    for (unsigned i = 0; i < n; i++) memcpy(m->base + fps60[i].off, &fps60[i].replacement, 4);
+    fprintf(stderr, "[totk] BOTW %s 60 FPS: controller interval %s (%u verified instructions; TOTK_FPS60=0 restores 30 FPS)\n",
+            TOTK_GAME_VERSION, frame_ratio ? "1 to 2" : "from 1", n);
 }
