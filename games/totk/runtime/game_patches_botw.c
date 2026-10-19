@@ -76,7 +76,67 @@ static void patch_realtime(Module *m) {
     uint32_t jump = branch(site, stub); memcpy(m->base + site, &jump, 4);
     fprintf(stderr, "[totk] BOTW real-time frame step: VFR interval ratio from the host (veneer +%#llx); TOTK_REALTIME=0 restores the interval ratio\n", (unsigned long long)stub);
 }
-int runtime_output_res(unsigned *w, unsigned *h) { (void)w; (void)h; return 0; }
+/* Output resolution (experimental, TOTK_OUTPUT_RES=<w>x<h>, e.g. 2560x1440; unset or 0: the shipping 1920x1080).
+   BOTW sizes its frame from two places in 1.9.0:
+   - the default display size, a 1920x1080 global (main+0x1e43dc0) initialised lazily at three inlined sites;
+   - the docked case of the display-mode switch (main+0x12660bc): output and scene widths as floats at +0x1210/+0x1214
+     (1920.0 / 1600.0: the 1600x900 scene), then the 1920x1080 size handed to the display (main+0x106dc70) and to the
+     crop (main+0xe9bb04).
+   Here every 1920x1080 becomes <w>x<h> and the scene width equals the output width (native resolution scene). */
+static unsigned out_w, out_h;
+int runtime_output_res(unsigned *w, unsigned *h) {
+    static int decided;
+    if (!decided) {
+        decided = 1;
+        const char *e = getenv("TOTK_OUTPUT_RES"); char tail;
+        if (e && *e && strcmp(e, "0") && strcmp(e, "auto")) {
+            if (sscanf(e, "%ux%u%c", &out_w, &out_h, &tail) != 2 || out_w < 640 || out_h < 360 || out_w > 7680 || out_h > 4320 || out_w > 0xffff || out_h > 0xffff)
+                runtime_fail("TOTK_OUTPUT_RES must be 0 or widthxheight");
+        }
+    }
+    if (out_w && w && h) { *w = out_w; *h = out_h; }
+    return out_w != 0;
+}
+static uint32_t movz(unsigned rd, unsigned imm, unsigned shift, int x) { return (x ? 0xd2800000u : 0x52800000u) | (shift / 16) << 21 | imm << 5 | rd; }
+static uint32_t movk(unsigned rd, unsigned imm, unsigned shift) { return 0xf2800000u | (shift / 16) << 21 | imm << 5 | rd; }
+/* TOTK_SCENE_WIDTH=<w> (experimental): only the docked scene width (shipping 1600; 1920 renders the scene at the
+   1080p output size), the output stays as it is. */
+static void patch_scene_width(Module *m) {
+    const char *e = getenv("TOTK_SCENE_WIDTH"); if (!e || !*e) return;
+    float fw = (float)atoi(e); uint32_t bits; memcpy(&bits, &fw, 4);
+    if (fw < 640 || fw > 7680 || (bits & 0xffff)) runtime_fail("TOTK_SCENE_WIDTH must be a width like 1920 or 2560");
+    uint32_t word; memcpy(&word, m->base + 0x12660c8, 4);
+    if (word != 0xf2e89908) runtime_fail("BOTW scene width original instruction mismatch");
+    word = movk(8, bits >> 16, 48); memcpy(m->base + 0x12660c8, &word, 4);
+    fprintf(stderr, "[totk] BOTW docked scene width %.0f (experimental)\n", fw);
+}
+static void patch_output_res(Module *m) {
+    unsigned w, h; if (!runtime_output_res(&w, &h)) return;
+    float fw = (float)w; uint32_t fbits; memcpy(&fbits, &fw, 4);
+    if (fbits & 0xffff) runtime_fail("TOTK_OUTPUT_RES width is not exact in a float's upper half (use a width like 2560, 3840)");
+    unsigned fhi = fbits >> 16;
+    const Patch p[] = {
+        {0xc61ee8, 0xd280f009, movz(9, w, 0, 1), "default display size: mov x9, #w"}, {0xc61ef4, 0xf2c08709, movk(9, h, 32), "movk x9, #h, lsl #32"},
+        {0xc61f1c, 0xd280f009, movz(9, w, 0, 1), "default display size: mov x9, #w"}, {0xc61f28, 0xf2c08709, movk(9, h, 32), "movk x9, #h, lsl #32"},
+        {0x12618b8, 0xd280f009, movz(9, w, 0, 1), "default display size: mov x9, #w"}, {0x12618c4, 0xf2c08709, movk(9, h, 32), "movk x9, #h, lsl #32"},
+        {0x12660bc, 0xd2a89e08, movz(8, fhi, 16, 1), "docked: output width float (was 1920.0)"},
+        {0x12660c8, 0xf2e89908, movk(8, fhi, 48), "docked: scene width float (was 1600.0)"},
+        {0x12660d0, 0xd280f008, movz(8, w, 0, 1), "docked: display size width"}, {0x12660d4, 0xf2c08708, movk(8, h, 32), "docked: display size height"},
+        {0x12660f0, 0x52808704, movz(4, h, 0, 0), "docked: crop height"}, {0x1266104, 0x5280f003, movz(3, w, 0, 0), "docked: crop width"},
+    };
+    for (unsigned i = 0; i < sizeof p / sizeof *p; i++) {
+        uint32_t word; memcpy(&word, m->base + p[i].off, 4);
+        if (word != p[i].original) {
+            fprintf(stderr, "[totk] BOTW output resolution: main+%#llx is %08x, expected %08x (%s)\n", (unsigned long long)p[i].off, word, p[i].original, p[i].what);
+            runtime_fail("BOTW output resolution original instruction mismatch");
+        }
+    }
+    /* TOTK_OUTPUT_RES_SITES (diagnostic bit mask, default 7): 1 default display size, 2 docked widths, 4 display size and crop */
+    const char *ms = getenv("TOTK_OUTPUT_RES_SITES"); unsigned mask = ms ? (unsigned)strtoul(ms, NULL, 0) : 7;
+    for (unsigned i = 0; i < sizeof p / sizeof *p; i++) if (mask >> (i < 6 ? 0 : i < 8 ? 1 : 2) & 1) memcpy(m->base + p[i].off, &p[i].replacement, 4);
+    fprintf(stderr, "[totk] BOTW output resolution sites mask %#x\n", mask);
+    fprintf(stderr, "[totk] BOTW output resolution %ux%u, scene at the same size (experimental, %zu verified instructions)\n", w, h, sizeof p / sizeof *p);
+}
 uint64_t runtime_output_res_extra_bytes(void) { return 0; }
 int runtime_output_res_toggle(void) { return 0; }
 int runtime_output_mode_cycle(void) { return 0; }
@@ -117,6 +177,8 @@ void runtime_game_patches(Module *m) {
     if (strcmp(m->name, "main")) runtime_fail("BOTW game patches expect main");
     patch_realtime(m);
     patch_dynamic_res(m);
+    patch_scene_width(m);
+    patch_output_res(m);
     const char *e = getenv("TOTK_FPS60");
     if (e && !strcmp(e, "0")) {
         fprintf(stderr, "[totk] BOTW %s: shipping frame controller (TOTK_FPS60=0)\n", TOTK_GAME_VERSION);
