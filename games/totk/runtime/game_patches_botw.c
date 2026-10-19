@@ -97,9 +97,26 @@ static const Patch fps60[] = {
     {0x1126794, 0x71000d3f, 0x7100093f, "lower path: cmp w9, #2 (keep lowering down to 1; was #3)"},
 };
 
+/* Dynamic resolution off (the "Disable Dynamic Resolution" mod by theboy181 for 1.6.0, main+0x150aba4). The resolution
+   controller (main+0xf82e00 in 1.9.0) measures each frame's GPU time (ticks x 0.001 x 100 / 16666.67 us) and shifts its
+   history (+0x78 <- +0x80, +0x88) before choosing the render scale. Without the shift it never sees the load and keeps
+   the full 1600x900 (docked) scene. TOTK_DYNAMIC_RES=1 keeps the game's dynamic resolution. */
+static void patch_dynamic_res(Module *m) {
+    const char *e = getenv("TOTK_DYNAMIC_RES"); if (e && !strcmp(e, "1")) return;
+    const Patch p = {0xf82e80, 0xa907a668, 0xd503201f, "nop (was stp x8, x9, [x19, #0x78]: GPU time history shift)"};
+    uint32_t word; memcpy(&word, m->base + p.off, 4);
+    if (word != p.original) {
+        fprintf(stderr, "[totk] BOTW dynamic resolution: main+%#llx is %08x, expected %08x\n", (unsigned long long)p.off, word, p.original);
+        runtime_fail("BOTW dynamic resolution original instruction mismatch");
+    }
+    memcpy(m->base + p.off, &p.replacement, 4);
+    fprintf(stderr, "[totk] BOTW dynamic resolution off: full render scale (TOTK_DYNAMIC_RES=1 keeps the game's)\n");
+}
+
 void runtime_game_patches(Module *m) {
     if (strcmp(m->name, "main")) runtime_fail("BOTW game patches expect main");
     patch_realtime(m);
+    patch_dynamic_res(m);
     const char *e = getenv("TOTK_FPS60");
     if (e && !strcmp(e, "0")) {
         fprintf(stderr, "[totk] BOTW %s: shipping frame controller (TOTK_FPS60=0)\n", TOTK_GAME_VERSION);
