@@ -90,6 +90,14 @@ python3.14 build_app.py ~/Games/totk.xci -k ~/keys/prod.keys --update ~/Games/1.
 
 This produces the same **Tears of the Kingdom.app**, containing only the selected version. Quit the running game, then rebuild to the same `-o` path to replace the old app; there is no second game entry or version-selection menu. The window title shows the selected version, such as **Ver. 1.4.3**. Without `--update`, the script still builds 1.0.0.
 
+### Build from a folder of game files
+
+```sh
+python3.14 build_app.py --data-dir ~/Games/totk -k ~/keys/prod.keys
+```
+
+`--data-dir` replaces the game file and `--update`. Each `.nsp`, `.nsz` and `.xci` in the folder is identified by its content metadata (base game, update or DLC, title ID and version; file names are ignored), the game's packages are hashed against that metadata, and the build uses the base game and the newest supported update. Every file is listed with the reason it is used or not: another game, an unsupported version, a damaged dump. The results are cached in the work folder until a file changes. To only list a folder: `games/totk/scripts/identify_packages.py <folder> --keys <prod.keys> [--verify]` with the work folder's Python.
+
 You do not need to download separate 1.4.3 runtime tables or a shader cache. The build generates the version-specific runtime tables and first-launch shader seed from the game data you provide, then includes the shader seed in the app. The repository supplies the 1.4.3 patch code and verified hashes; only your base game, update and keys are external inputs.
 
 Allow about **40 GB free for a fresh update build**, or **19 GB extra** when the base data is already cached, with the app on the same APFS volume. The merge reads the base NCA through a bounded range of the original container, temporarily extracts the much smaller update NCA, and verifies every IVFC level. It fetches a pinned [hactool](https://github.com/SciresM/hactool) source and builds it with clang/make. Temporary ticket files are private and removed after the merge; key values are not passed on the command line or printed.
@@ -250,6 +258,14 @@ python3.14 build_app.py ~/Games/totk.xci -k ~/keys/prod.keys --update ~/Games/1.
 ```
 
 仍然只生成同一个 **Tears of the Kingdom.app**，包内只含选定版本。先退出正在运行的游戏，再用相同 `-o` 路径重新构建即可替换旧 App，不增加第二个游戏入口或版本选择菜单。窗口标题显示选定版本，例如 **Ver. 1.4.3**。不加 `--update` 时仍构建 1.0.0。
+
+### 从游戏文件夹构建
+
+```sh
+python3.14 build_app.py --data-dir ~/Games/totk -k ~/keys/prod.keys
+```
+
+`--data-dir` 取代游戏文件和 `--update`。文件夹中的每个 `.nsp`、`.nsz` 和 `.xci` 都按其内容元数据识别（本体、更新或 DLC，标题 ID 和版本；不看文件名），该游戏的包会按元数据校验哈希，构建使用本体和受支持的最新更新。每个文件都会列出是否使用及原因：其他游戏、不支持的版本、损坏的转储。结果缓存在工作目录中，文件改变后重新检查。只想列出文件夹内容：用工作目录的 Python 运行 `games/totk/scripts/identify_packages.py <文件夹> --keys <prod.keys> [--verify]`。
 
 无需另外下载 1.4.3 运行时表或着色器缓存。构建流程会根据你提供的游戏数据生成对应版本的运行时表和首启着色器种子，并将种子放进 App。仓库已包含 1.4.3 补丁代码和校验哈希；外部只需准备自己的本体、更新包和密钥。
 

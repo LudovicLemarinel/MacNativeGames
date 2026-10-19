@@ -62,6 +62,8 @@ uint64_t runtime_image_bytes(void);
 void runtime_fs_init(void);
 void *runtime_fs_override(const char *name);
 void runtime_fs_probe(void);
+int runtime_aoc_count(void);
+int runtime_aoc_list(int *out, int offset, int count);
 
 void *runtime_observer(const char *name);
 

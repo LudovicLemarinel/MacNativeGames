@@ -1,4 +1,4 @@
-/* Read-only game RomFS, backed by the player's fully IVFC-verified image. */
+/* Read-only game RomFS, backed by the player's fully IVFC-verified image, and the DLC (add-on content) RomFS images. */
 #include "runtime.h"
 #include "totk_ui_lang.h"
 #include "romfs_config.h"
@@ -19,9 +19,9 @@
 #define UNSUPPORTED 0x6402u
 #define INVALID 0xe402u
 #define NH 65536
-static uint8_t *index_bytes;
-static size_t index_size;
-static uint64_t file_count,strings_offset;
+/* A mapped runtime-index.bin (scripts/prepare_romfs_backend.py): file rows sorted by path, then the names. */
+typedef struct { const uint8_t *bytes; uint64_t count,strings; } View;
+static View rom;
 static int image_fd=-1;
 /* Split image: romfs.bin.000, .001, ... of equal size (the last one shorter), read in place. The phone gets the 17 GB
    image this way: devicectl drops the connection on a single file of that size, and joining the parts on the device
@@ -49,10 +49,14 @@ static uint64_t handles[NH]; /* file index + 1; 0 is free */
 static struct { uint64_t index,size; int fd; } overlays[NOVL];
 static unsigned noverlay;
 static uint8_t handle_ovl[NH]; /* overlay slot + 1 of an open handle, 0 = original */
+static uint8_t handle_vol[NH]; /* add-on content slot + 1 of an open handle, 0 = the game's RomFS */
 typedef struct { uint64_t offset,size;uint32_t name,len; } Entry;
 _Static_assert(sizeof(Entry)==24,"index entry layout");
-static Entry entry(uint64_t i) {Entry e;memcpy(&e,index_bytes+24+i*24,24);return e;}
-static const char *entry_name(Entry e) {return (char *)index_bytes+strings_offset+e.name;}
+static Entry ventry(const View *v,uint64_t i) {Entry e;memcpy(&e,v->bytes+24+i*24,24);return e;}
+static const char *vname(const View *v,Entry e) {return (const char *)v->bytes+v->strings+e.name;}
+static uint64_t vlower(const View *v,const char *name) {uint64_t lo=0,hi=v->count;while(lo<hi){uint64_t m=lo+(hi-lo)/2;if(strcmp(vname(v,ventry(v,m)),name)<0)lo=m+1;else hi=m;}return lo;}
+static Entry entry(uint64_t i) {return ventry(&rom,i);}
+static const char *entry_name(Entry e) {return vname(&rom,e);}
 static void need(int c,const char *m) {if(!c)runtime_fail(m);}
 static void sha_fd(int fd,const char *expected,uint64_t total,const char *stage) {
  CC_SHA256_CTX c;CC_SHA256_Init(&c);uint8_t *buffer=malloc(8<<20);need(buffer!=NULL,"hash buffer");
@@ -68,8 +72,8 @@ typedef struct {
  uint64_t dev,ino,size;
  int64_t mtime_sec,mtime_nsec,ctime_sec,ctime_nsec,birth_sec,birth_nsec;
 } RomfsProof;
-static RomfsProof proof_for(const struct stat *s) {
- RomfsProof p={0};memcpy(p.magic,"TOTKRFS-PROOF-1",16);memcpy(p.sha256,ROMFS_IMAGE_SHA256,65);
+static RomfsProof proof_for(const struct stat *s,const char *sha256) {
+ RomfsProof p={0};memcpy(p.magic,"TOTKRFS-PROOF-1",16);snprintf(p.sha256,sizeof p.sha256,"%s",sha256);
  p.dev=(uint64_t)s->st_dev;p.ino=(uint64_t)s->st_ino;p.size=(uint64_t)s->st_size;
  p.mtime_sec=s->st_mtimespec.tv_sec;p.mtime_nsec=s->st_mtimespec.tv_nsec;
  p.ctime_sec=s->st_ctimespec.tv_sec;p.ctime_nsec=s->st_ctimespec.tv_nsec;
@@ -87,7 +91,7 @@ static int proof_equal(const RomfsProof *a,const RomfsProof *b) {
 static void chunk_proofs(RomfsProof *out) {
  /* ctime is left out: reinstalling the iOS app touches the data container's file metadata (ctime) without changing a
     byte, which made every launch hash 17 GB again. A content change still moves mtime (and size). */
- for(unsigned c=0;c<nchunks;c++){struct stat st;need(fstat(chunk_fds[c],&st)==0&&S_ISREG(st.st_mode),"RomFS part stat");out[c]=proof_for(&st);out[c].ctime_sec=out[c].ctime_nsec=0;}
+ for(unsigned c=0;c<nchunks;c++){struct stat st;need(fstat(chunk_fds[c],&st)==0&&S_ISREG(st.st_mode),"RomFS part stat");out[c]=proof_for(&st,ROMFS_IMAGE_SHA256);out[c].ctime_sec=out[c].ctime_nsec=0;}
 }
 static void verify_chunks(const char *dir) {
  RomfsProof want[MAX_CHUNKS],saved[MAX_CHUNKS],after[MAX_CHUNKS];size_t bytes=nchunks*sizeof(RomfsProof);chunk_proofs(want);
@@ -115,24 +119,29 @@ static void open_chunks(const char *dir) {
  image_fd=chunk_fds[0];
  fprintf(stderr,"[totk] RomFS image in %u parts of %llu bytes\n",nchunks,(unsigned long long)chunk_size);
 }
-static void verify_image(int fd,const char *dir) {
- if(nchunks){verify_chunks(dir);return;}
+/* The full SHA-256 of a single-file image, skipped while the record <proof dir>/<proof> from an earlier full hash still
+   matches the file (proof_for). */
+static void verify_file(int fd,const char *dir,const char *sha256,const char *proof,const char *what) {
  const char *pdir=getenv("TOTK_ROMFS_PROOF_DIR");if(pdir&&*pdir)dir=pdir;
  struct stat before,after;need(fstat(fd,&before)==0&&S_ISREG(before.st_mode),"RomFS image stat");
- RomfsProof want=proof_for(&before),saved;
- char path[4096],tmp[4096];need(snprintf(path,sizeof(path),"%s/.romfs-verified-v1",dir)<(int)sizeof(path),"RomFS proof path");
+ RomfsProof want=proof_for(&before,sha256),saved;
+ char path[4096],tmp[4096];need(snprintf(path,sizeof(path),"%s/%s",dir,proof)<(int)sizeof(path),"RomFS proof path");
  int force=getenv("TOTK_ROMFS_VERIFY")&&!strcmp(getenv("TOTK_ROMFS_VERIFY"),"full");
  int proof_fd=open(path,O_RDONLY|O_NOFOLLOW);
  if(proof_fd>=0){struct stat ps;int ok=fstat(proof_fd,&ps)==0&&S_ISREG(ps.st_mode)&&ps.st_size==sizeof(saved)&&read(proof_fd,&saved,sizeof(saved))==sizeof(saved);close(proof_fd);
-  if(ok&&!force&&proof_equal(&saved,&want)){fprintf(stderr,"[totk] RomFS unchanged; reused full SHA256 verification record (%llu bytes)\n",(unsigned long long)want.size);runtime_boot_progress(TOTK_UI("游戏资源校验记录有效","Game data verification record is valid"),want.size,want.size);return;}}
- fprintf(stderr,"[totk] verifying local RomFS SHA256 (%llu bytes)%s\n",(unsigned long long)want.size,force?" [forced]":"");
- runtime_boot_progress(TOTK_UI("校验游戏资源","Verifying game data"),0,want.size);sha_fd(fd,ROMFS_IMAGE_SHA256,want.size,TOTK_UI("校验游戏资源","Verifying game data"));
+  if(ok&&!force&&proof_equal(&saved,&want)){fprintf(stderr,"[totk] %s unchanged; reused full SHA256 verification record (%llu bytes)\n",what,(unsigned long long)want.size);runtime_boot_progress(TOTK_UI("游戏资源校验记录有效","Game data verification record is valid"),want.size,want.size);return;}}
+ fprintf(stderr,"[totk] verifying local %s SHA256 (%llu bytes)%s\n",what,(unsigned long long)want.size,force?" [forced]":"");
+ runtime_boot_progress(TOTK_UI("校验游戏资源","Verifying game data"),0,want.size);sha_fd(fd,sha256,want.size,TOTK_UI("校验游戏资源","Verifying game data"));
  need(fstat(fd,&after)==0,"RomFS image stat after hash");
- RomfsProof finished=proof_for(&after);need(proof_equal(&want,&finished),"RomFS changed during verification");
- if(snprintf(tmp,sizeof(tmp),"%s/.romfs-verified-v1.%ld.tmp",dir,(long)getpid())>=(int)sizeof(tmp))return;
+ RomfsProof finished=proof_for(&after,sha256);need(proof_equal(&want,&finished),"RomFS changed during verification");
+ if(snprintf(tmp,sizeof(tmp),"%s/%s.%ld.tmp",dir,proof,(long)getpid())>=(int)sizeof(tmp))return;
  int out=open(tmp,O_WRONLY|O_CREAT|O_EXCL,0600);
  if(out>=0){ssize_t n=write(out,&want,sizeof(want));int ok=n==sizeof(want)&&fsync(out)==0;close(out);
   if(ok){if(rename(tmp,path)!=0)unlink(tmp);}else unlink(tmp);}
+}
+static void verify_image(int fd,const char *dir) {
+ if(nchunks){verify_chunks(dir);return;}
+ verify_file(fd,dir,ROMFS_IMAGE_SHA256,".romfs-verified-v1","RomFS");
 }
 static void sha_range(int fd,uint64_t offset,uint64_t size,const char *expected,const char *what) {
  CC_SHA256_CTX c;CC_SHA256_Init(&c);uint8_t *buffer=malloc(8<<20);need(buffer!=NULL,"hash buffer");
@@ -150,7 +159,7 @@ static void overlay_load(const char *dir,int required) {
  while(fgets(line,sizeof(line),m)){
   if(line[0]=='#'||line[0]=='\n')continue;char name[4096],sha[65],orig[65];unsigned long long size=0;
   need(sscanf(line,"%4095[^\t]\t%llu\t%64[0-9a-f]\t%64[0-9a-f]",name,&size,sha,orig)==4&&strlen(sha)==64&&strlen(orig)==64,"RomFS overlay manifest line");
-  need(path_ok(name)&&noverlay<NOVL,"RomFS overlay path or count");uint64_t i=lower(name);need(i<file_count&&!strcmp(entry_name(entry(i)),name),"RomFS overlay names a file the RomFS lacks");
+  need(path_ok(name)&&noverlay<NOVL,"RomFS overlay path or count");uint64_t i=lower(name);need(i<rom.count&&!strcmp(entry_name(entry(i)),name),"RomFS overlay names a file the RomFS lacks");
   for(unsigned k=0;k<noverlay;k++)need(overlays[k].index!=i,"RomFS overlay: two overlays replace the same file");
   Entry e=entry(i);sha_range(image_fd,e.offset,e.size,orig,"original");
   char file[8200];need(snprintf(file,sizeof(file),"%s/%s",dir,name)<(int)sizeof(file),"RomFS overlay file path");int fd=open(file,O_RDONLY);struct stat st;
@@ -167,17 +176,22 @@ static void overlay_init(void) {
  unsigned w,h;if(runtime_output_res(&w,&h)&&runtime_output_res_extra_bytes()){const char *out=getenv("TOTK_ROMFS_PATCHES_OUT");char d[4096];
   need(snprintf(d,sizeof(d),"%s/%ux%u",out?out:"extracted/" TOTK_GAME_DIR "/romfs-patches-out",w,h)<(int)sizeof(d),"RomFS output overlay path");overlay_load(d,1);}
 }
+/* <dir>/runtime-index.bin, checked against its SHA-256 and against an image of image_size bytes. */
+static void map_index(const char *dir,const char *sha256,uint64_t image_size,View *v) {
+ char path[4096];need(snprintf(path,sizeof(path),"%s/runtime-index.bin",dir)<(int)sizeof(path),"RomFS path");int fd=open(path,O_RDONLY);need(fd>=0,"RomFS index missing");
+ struct stat st;need(fstat(fd,&st)==0&&st.st_size>=24&&st.st_size<128*1024*1024,"RomFS index size");sha_fd(fd,sha256,0,NULL);
+ size_t size=(size_t)st.st_size;uint8_t *bytes=mmap(NULL,size,PROT_READ,MAP_PRIVATE,fd,0);close(fd);need(bytes!=MAP_FAILED,"map RomFS index");
+ need(!memcmp(bytes,"TOTKRFS1",8),"RomFS index format");uint64_t count,strings;memcpy(&count,bytes+8,8);memcpy(&strings,bytes+16,8);
+ need(count<1000000&&strings==24+count*24&&strings<size,"RomFS index layout");
+ v->bytes=bytes;v->count=count;v->strings=strings;
+ const char *previous=NULL;
+ for(uint64_t i=0;i<count;i++){Entry e=ventry(v,i);need(e.offset<=image_size&&e.size<=image_size-e.offset,"RomFS file bounds");need(e.name<size-strings&&e.len>1&&e.len<=size-strings-e.name,"RomFS name bounds");const char *name=vname(v,e);need(name[e.len-1]==0&&strlen(name)==e.len-1&&(!previous||strcmp(previous,name)<0),"RomFS sorted paths");previous=name;}
+}
 void runtime_fs_init(void) {
  if(image_fd>=0)return;
  const char *dir=getenv("TOTK_ROMFS");if(!dir)dir="extracted/" TOTK_GAME_DIR "/romfs";char path[4096];
- need(snprintf(path,sizeof(path),"%s/runtime-index.bin",dir)<(int)sizeof(path),"RomFS path");int fd=open(path,O_RDONLY);need(fd>=0,"RomFS index missing");
- struct stat st;need(fstat(fd,&st)==0&&st.st_size>=24&&st.st_size<128*1024*1024,"RomFS index size");runtime_boot_progress(TOTK_UI("读取资源索引","Reading the data index"),0,0);sha_fd(fd,ROMFS_INDEX_SHA256,0,NULL);
- index_size=(size_t)st.st_size;index_bytes=mmap(NULL,index_size,PROT_READ,MAP_PRIVATE,fd,0);close(fd);need(index_bytes!=MAP_FAILED,"map RomFS index");
- need(!memcmp(index_bytes,"TOTKRFS1",8),"RomFS index format");memcpy(&file_count,index_bytes+8,8);memcpy(&strings_offset,index_bytes+16,8);
- need(file_count<1000000&&strings_offset==24+file_count*24&&strings_offset<index_size,"RomFS index layout");
- const char *previous=NULL;
- for(uint64_t i=0;i<file_count;i++){Entry e=entry(i);need(e.offset<=ROMFS_IMAGE_SIZE&&e.size<=ROMFS_IMAGE_SIZE-e.offset,"RomFS file bounds");need(e.name<index_size-strings_offset&&e.len>1&&e.len<=index_size-strings_offset-e.name,"RomFS name bounds");const char *name=entry_name(e);need(name[e.len-1]==0&&strlen(name)==e.len-1&&(!previous||strcmp(previous,name)<0),"RomFS sorted paths");previous=name;}
- need(snprintf(path,sizeof(path),"%s/romfs.bin",dir)<(int)sizeof(path),"RomFS image path");image_fd=open(path,O_RDONLY);
+ runtime_boot_progress(TOTK_UI("读取资源索引","Reading the data index"),0,0);map_index(dir,ROMFS_INDEX_SHA256,ROMFS_IMAGE_SIZE,&rom);
+ struct stat st;need(snprintf(path,sizeof(path),"%s/romfs.bin",dir)<(int)sizeof(path),"RomFS image path");image_fd=open(path,O_RDONLY);
  if(image_fd<0)open_chunks(dir);
  else need(fstat(image_fd,&st)==0&&(uint64_t)st.st_size==ROMFS_IMAGE_SIZE,"RomFS image size");
  verify_image(image_fd,dir);
@@ -188,13 +202,62 @@ void runtime_fs_init(void) {
  }
  runtime_boot_status(TOTK_UI("准备游戏资源","Preparing game data"),TOTK_UI("检查分辨率补丁并挂载只读游戏资源","Checking the resolution patch and mounting the read-only game data"));
  overlay_init();
- fprintf(stderr,"[totk] native read-only RomFS ready: %llu files\n",(unsigned long long)file_count);
+ fprintf(stderr,"[totk] native read-only RomFS ready: %llu files\n",(unsigned long long)rom.count);
 }
 static int path_ok(const char *p) {return romfs_path_valid_relative(p);}
-static const char *rom_path(const char *path) {
- return romfs_path_relative(mount_name,path);
+static uint64_t lower(const char *name) {return vlower(&rom,name);}
+/* Add-on content (DLC): <TOTK_AOC, default extracted/<version>/aoc>/manifest.tsv (build_app.py step_dlc) lists one
+   RomFS per DLC the build verified: nn::aoc index, title ID, image size, image SHA-256, index SHA-256. Each image is
+   hashed like the game's RomFS (a record of the full hash is reused while the file is unchanged). nn::aoc lists these
+   indices only; nn::fs::MountAddOnContent mounts one under the game's name (BOTW: index 1 as aoc:). TOTK_AOC=0: none. */
+#define NAOC 8
+static struct { int index; char title[17]; View view; int fd; char mount[32]; } aoc[NAOC];
+static unsigned naoc;
+static pthread_once_t aoc_once=PTHREAD_ONCE_INIT;
+static void aoc_load(void) {
+ const char *dir=getenv("TOTK_AOC");if(dir&&!strcmp(dir,"0")){fprintf(stderr,"[totk] add-on content: off (TOTK_AOC=0)\n");return;}
+ if(!dir)dir="extracted/" TOTK_GAME_DIR "/aoc";
+ char path[4096];need(snprintf(path,sizeof(path),"%s/manifest.tsv",dir)<(int)sizeof(path),"add-on content path");FILE *m=fopen(path,"r");
+ if(!m){fprintf(stderr,"[totk] add-on content: none (%s)\n",path);return;}
+ char line[1024];
+ while(fgets(line,sizeof(line),m)){
+  if(line[0]=='#'||line[0]=='\n')continue;int index;char title[17],sha[65],isha[65];unsigned long long size;
+  need(sscanf(line,"%d\t%16[0-9A-F]\t%llu\t%64[0-9a-f]\t%64[0-9a-f]",&index,title,&size,sha,isha)==5&&strlen(title)==16&&strlen(sha)==64&&strlen(isha)==64,"add-on content manifest line");
+  need(index>0&&naoc<NAOC,"add-on content index or count");for(unsigned k=0;k<naoc;k++)need(aoc[k].index!=index,"add-on content: an index listed twice");
+  char folder[4096];need(snprintf(folder,sizeof(folder),"%s/%s",dir,title)<(int)sizeof(folder),"add-on content folder");
+  need(snprintf(path,sizeof(path),"%s/romfs.bin",folder)<(int)sizeof(path),"add-on content image path");int fd=open(path,O_RDONLY);struct stat st;
+  need(fd>=0&&fstat(fd,&st)==0&&(uint64_t)st.st_size==size,"add-on content image missing or wrong size (rebuild the app)");
+  char proof[64],what[64];snprintf(proof,sizeof(proof),".aoc-%s-verified-v1",title);snprintf(what,sizeof(what),"DLC %s RomFS",title);
+  verify_file(fd,folder,sha,proof,what);
+  aoc[naoc].index=index;memcpy(aoc[naoc].title,title,17);aoc[naoc].fd=fd;map_index(folder,isha,size,&aoc[naoc].view);
+  fprintf(stderr,"[totk] add-on content %d (%s): %llu files\n",index,title,(unsigned long long)aoc[naoc].view.count);naoc++;
+ }
+ fclose(m);
 }
-static uint64_t lower(const char *name) {uint64_t lo=0,hi=file_count;while(lo<hi){uint64_t m=lo+(hi-lo)/2;if(strcmp(entry_name(entry(m)),name)<0)lo=m+1;else hi=m;}return lo;}
+static void aoc_init(void) {pthread_once(&aoc_once,aoc_load);}
+int runtime_aoc_count(void) {aoc_init();return (int)naoc;}
+int runtime_aoc_list(int *out,int offset,int count) {
+ aoc_init();if(offset<0||count<0||(!out&&count))runtime_fail("invalid add-on content list range");
+ int n=0;for(unsigned k=(unsigned)offset;k<naoc&&n<count;k++)out[n++]=aoc[k].index;return n;
+}
+static unsigned mount_aoc(const char *name,int index,void *cache,uint64_t size) {
+ (void)cache;(void)size;aoc_init();if(!name||!path_ok(name)||strlen(name)>=sizeof(aoc[0].mount)||strchr(name,'/')||strchr(name,':'))return INVALID;
+ pthread_mutex_lock(&lock);
+ int busy=!strcmp(name,mount_name);for(unsigned k=0;k<naoc;k++)busy|=!strcmp(name,aoc[k].mount);
+ for(unsigned k=0;k<naoc;k++)if(aoc[k].index==index){
+  if(busy||*aoc[k].mount){pthread_mutex_unlock(&lock);runtime_fail("add-on content mount name or index already mounted");}
+  strcpy(aoc[k].mount,name);pthread_mutex_unlock(&lock);
+  fprintf(stderr,"[totk] add-on content %d (%s) mounted as %s:\n",index,aoc[k].title,name);return 0;}
+ pthread_mutex_unlock(&lock);fprintf(stderr,"[totk] add-on content %d is not packaged\n",index);return NOT_FOUND;
+}
+static unsigned aoc_cache_size(uint64_t *out,int index) {(void)index;if(!out)return INVALID;*out=0;return 0;}
+/* The volume a mounted path names (0: the game's RomFS, k: aoc[k-1]) and the path inside it; -1 if none. */
+static int resolve(const char *path,const char **rel) {
+ const char *p=romfs_path_relative(mount_name,path);if(p){*rel=p;return 0;}
+ for(unsigned k=0;k<naoc;k++)if(*aoc[k].mount&&(p=romfs_path_relative(aoc[k].mount,path))){*rel=p;return (int)k+1;}
+ return -1;
+}
+static const View *volume(int v) {return v?&aoc[v-1].view:&rom;}
 static unsigned mount_rom(const char *name,void *cache,uint64_t size) {
  (void)cache;(void)size;runtime_fs_init();if(!name||!path_ok(name)||strlen(name)>=sizeof(mount_name)||strchr(name,'/')||strchr(name,':'))return INVALID;
  if(*mount_name&&strcmp(name,mount_name))runtime_fail("second RomFS mount not implemented");strcpy(mount_name,name);return 0;
@@ -205,15 +268,16 @@ static void fs_log(const char *what,const char *path){static int on=-1;static ui
 void runtime_fs_log(const char *what,const char *path){fs_log(what,path);}
 unsigned runtime_romfs_open(uint64_t *out,const char *path,int mode) {
  fs_log("rom",path?path:"(null)");
- if(!out||mode!=1)return UNSUPPORTED;const char *p=rom_path(path);if(!p)return NOT_FOUND;uint64_t i=lower(p);if(i>=file_count||strcmp(p,entry_name(entry(i))))return NOT_FOUND;
- uint8_t ov=0;for(unsigned k=0;k<noverlay;k++)if(overlays[k].index==i)ov=(uint8_t)(k+1);
- pthread_mutex_lock(&lock);for(unsigned j=1;j<NH;j++)if(!handles[j]){handles[j]=i+1;handle_ovl[j]=ov;*out=0x100000000ULL+j;pthread_mutex_unlock(&lock);return 0;}pthread_mutex_unlock(&lock);runtime_fail("file handle table full");return INVALID;
+ if(!out||mode!=1)return UNSUPPORTED;const char *p;int v=resolve(path,&p);if(v<0)return NOT_FOUND;const View *ix=volume(v);
+ uint64_t i=vlower(ix,p);if(i>=ix->count||strcmp(p,vname(ix,ventry(ix,i))))return NOT_FOUND;
+ uint8_t ov=0;if(!v)for(unsigned k=0;k<noverlay;k++)if(overlays[k].index==i)ov=(uint8_t)(k+1);
+ pthread_mutex_lock(&lock);for(unsigned j=1;j<NH;j++)if(!handles[j]){handles[j]=i+1;handle_ovl[j]=ov;handle_vol[j]=(uint8_t)v;*out=0x100000000ULL+j;pthread_mutex_unlock(&lock);return 0;}pthread_mutex_unlock(&lock);runtime_fail("file handle table full");return INVALID;
 }
-static int handle_entry(uint64_t h,Entry *e) {if(h<=0x100000000ULL||h>=0x100000000ULL+NH)return 0;pthread_mutex_lock(&lock);uint64_t i=handles[h-0x100000000ULL];pthread_mutex_unlock(&lock);if(!i)return 0;*e=entry(i-1);return 1;}
-/* Where an open handle's bytes come from: the overlay file, or the original's range of the image. */
+static int handle_entry(uint64_t h,Entry *e) {if(h<=0x100000000ULL||h>=0x100000000ULL+NH)return 0;pthread_mutex_lock(&lock);uint64_t i=handles[h-0x100000000ULL];uint8_t v=handle_vol[h-0x100000000ULL];pthread_mutex_unlock(&lock);if(!i)return 0;*e=ventry(volume(v),i-1);return 1;}
+/* Where an open handle's bytes come from: the overlay file, or the original's range of its image. */
 static void handle_source(uint64_t h,const Entry *e,int *fd,uint64_t *base,uint64_t *size) {
- pthread_mutex_lock(&lock);uint8_t ov=handle_ovl[h-0x100000000ULL];pthread_mutex_unlock(&lock);
- if(ov){*fd=overlays[ov-1].fd;*base=0;*size=overlays[ov-1].size;}else{*fd=image_fd;*base=e->offset;*size=e->size;}
+ pthread_mutex_lock(&lock);uint8_t ov=handle_ovl[h-0x100000000ULL],v=handle_vol[h-0x100000000ULL];pthread_mutex_unlock(&lock);
+ if(ov){*fd=overlays[ov-1].fd;*base=0;*size=overlays[ov-1].size;}else{*fd=v?aoc[v-1].fd:image_fd;*base=e->offset;*size=e->size;}
 }
 unsigned runtime_romfs_read(uint64_t *out,uint64_t h,int64_t offset,void *buffer,uint64_t size) {
  Entry e;if(!out||offset<0||!handle_entry(h,&e))return INVALID;int fd;uint64_t base,fsize;handle_source(h,&e,&fd,&base,&fsize);if((uint64_t)offset>fsize||(!buffer&&size))return INVALID;
@@ -231,23 +295,39 @@ unsigned runtime_romfs_read(uint64_t *out,uint64_t h,int64_t offset,void *buffer
  *out=done;return 0;
 }
 unsigned runtime_romfs_size(int64_t *out,uint64_t h) {Entry e;if(!out||!handle_entry(h,&e))return INVALID;int fd;uint64_t base,size;handle_source(h,&e,&fd,&base,&size);*out=(int64_t)size;return 0;}
-void runtime_romfs_close(uint64_t h) {Entry e;if(!handle_entry(h,&e))runtime_fail("close invalid file handle");pthread_mutex_lock(&lock);handles[h-0x100000000ULL]=0;handle_ovl[h-0x100000000ULL]=0;pthread_mutex_unlock(&lock);}
+void runtime_romfs_close(uint64_t h) {Entry e;if(!handle_entry(h,&e))runtime_fail("close invalid file handle");pthread_mutex_lock(&lock);handles[h-0x100000000ULL]=0;handle_ovl[h-0x100000000ULL]=0;handle_vol[h-0x100000000ULL]=0;pthread_mutex_unlock(&lock);}
 unsigned runtime_romfs_entry_type(int *out,const char *path) {
- if(!out)return INVALID;const char *p=rom_path(path);if(!p)return NOT_FOUND;uint64_t i=lower(p);if(i<file_count&&!strcmp(entry_name(entry(i)),p)){*out=1;return 0;}
- char dir[4096];if(snprintf(dir,sizeof(dir),"%s/",p)>=(int)sizeof(dir))return INVALID;i=lower(dir);if(i<file_count&&!strncmp(entry_name(entry(i)),dir,strlen(dir))){*out=0;return 0;}return NOT_FOUND;
+ if(!out)return INVALID;const char *p;int v=resolve(path,&p);if(v<0)return NOT_FOUND;const View *ix=volume(v);
+ uint64_t i=vlower(ix,p);if(i<ix->count&&!strcmp(vname(ix,ventry(ix,i)),p)){*out=1;return 0;}
+ char dir[4096];if(snprintf(dir,sizeof(dir),"%s/",p)>=(int)sizeof(dir))return INVALID;i=vlower(ix,dir);if(i<ix->count&&!strncmp(vname(ix,ventry(ix,i)),dir,strlen(dir))){*out=0;return 0;}return NOT_FOUND;
 }
-int runtime_romfs_owns(const char *path) {size_t n=strlen(mount_name);return n&&path&&!strncmp(path,mount_name,n)&&path[n]==':';}
+static int owns(const char *mount,const char *path) {size_t n=strlen(mount);return n&&path&&!strncmp(path,mount,n)&&path[n]==':';}
+int runtime_romfs_owns(const char *path) {
+ if(owns(mount_name,path))return 1;for(unsigned k=0;k<naoc;k++)if(owns(aoc[k].mount,path))return 1;return 0;
+}
+/* nn::fs::Unmount of a read-only mount (name without the colon): an add-on content mount is released once its files
+   are closed; the game's RomFS stays mounted. 0: not one of these mounts. */
+int runtime_romfs_unmount(const char *name) {
+ if(!name)return 0;if(*mount_name&&!strcmp(name,mount_name))return 1;
+ pthread_mutex_lock(&lock);
+ for(unsigned k=0;k<naoc;k++)if(*aoc[k].mount&&!strcmp(name,aoc[k].mount)){
+  for(unsigned j=1;j<NH;j++)if(handles[j]&&handle_vol[j]==k+1){pthread_mutex_unlock(&lock);runtime_fail("unmount of add-on content with open files");}
+  *aoc[k].mount=0;pthread_mutex_unlock(&lock);fprintf(stderr,"[totk] add-on content %d unmounted\n",aoc[k].index);return 1;}
+ pthread_mutex_unlock(&lock);return 0;
+}
 int runtime_romfs_handle(uint64_t h) {return h>0x100000000ULL&&h<0x100000000ULL+NH;}
 unsigned runtime_romfs_read_options(uint64_t *out,uint64_t h,int64_t off,void *buf,uint64_t size) {return runtime_romfs_read(out,h,off,buf,size);}
 void *runtime_fs_override(const char *name) {
  static const struct{const char *name;void *fn;} map[]={
- {"_ZN2nn2fs8MountRomEPKcPvm",mount_rom},{"_ZN2nn2fs22QueryMountRomCacheSizeEPm",cache_size}};
+ {"_ZN2nn2fs8MountRomEPKcPvm",mount_rom},{"_ZN2nn2fs22QueryMountRomCacheSizeEPm",cache_size},
+ {"_ZN2nn2fs17MountAddOnContentEPKciPvm",mount_aoc},{"_ZN2nn2fs31QueryMountAddOnContentCacheSizeEPmi",aoc_cache_size}};
  for(size_t i=0;i<sizeof(map)/sizeof(map[0]);i++)if(!strcmp(name,map[i].name))return map[i].fn;return runtime_fs_host_override(name);
 }
 void runtime_fs_probe(void) {
  runtime_fs_init();need(mount_rom("rom",NULL,0)==0,"mount RomFS");unsigned count=0;uint8_t buffer[257];uint64_t sum=0;
  /* Audio stream paths include an extra slash after the mount root. Verify
-    actual resource lookup and bytes, while still rejecting path traversal. */
+    actual resource lookup and bytes, while still rejecting path traversal. (A TOTK stream; BOTW has no such file.) */
+#ifndef GAME_BOTW
  {
   const char *name="Sound/Resource/Stream/Dm_OP_0001.bwav";
   char path[256];uint8_t expected[257],actual[257];uint64_t h,n;
@@ -262,9 +342,23 @@ void runtime_fs_probe(void) {
   }
   need(runtime_romfs_open(&h,"rom://../Sound/Resource/Stream/Dm_OP_0001.bwav",1)!=0,"reject traversal after repeated root separator");
  }
- for(uint64_t i=0;i<file_count;i+=file_count/64){Entry e=entry(i);char p[4096];need(snprintf(p,sizeof(p),"rom:/%s",entry_name(e))<(int)sizeof(p),"probe path");uint64_t h=0,n=0;int64_t size;need(!runtime_romfs_open(&h,p,1)&&!runtime_romfs_size(&size,h)&&(uint64_t)size==e.size,"probe open/size");need(!runtime_romfs_read(&n,h,0,buffer,sizeof(buffer)),"probe partial read");for(uint64_t j=0;j<n;j++)sum=sum*131+buffer[j];need(!runtime_romfs_read(&n,h,size,buffer,1)&&n==0,"probe EOF");runtime_romfs_close(h);count++;}
+#endif
+ for(uint64_t i=0;i<rom.count;i+=rom.count/64){Entry e=entry(i);char p[4096];need(snprintf(p,sizeof(p),"rom:/%s",entry_name(e))<(int)sizeof(p),"probe path");uint64_t h=0,n=0;int64_t size;need(!runtime_romfs_open(&h,p,1)&&!runtime_romfs_size(&size,h)&&(uint64_t)size==e.size,"probe open/size");need(!runtime_romfs_read(&n,h,0,buffer,sizeof(buffer)),"probe partial read");for(uint64_t j=0;j<n;j++)sum=sum*131+buffer[j];need(!runtime_romfs_read(&n,h,size,buffer,1)&&n==0,"probe EOF");runtime_romfs_close(h);count++;}
  for(unsigned k=0;k<noverlay;k++){Entry e=entry(overlays[k].index);char p[4096];need(snprintf(p,sizeof(p),"rom:/%s",entry_name(e))<(int)sizeof(p),"probe overlay path");uint64_t oh=0,n=0;int64_t size=0;uint8_t a[64],b[64];
   need(!runtime_romfs_open(&oh,p,1)&&!runtime_romfs_size(&size,oh)&&(uint64_t)size==overlays[k].size,"probe overlay size");need(!runtime_romfs_read(&n,oh,size-64,a,64)&&n==64&&pread(overlays[k].fd,b,64,(off_t)(size-64))==64&&!memcmp(a,b,64),"probe overlay bytes");runtime_romfs_close(oh);}
  uint64_t h=0;need(runtime_romfs_open(&h,"rom:/../main",1)==NOT_FOUND,"reject traversal");need(runtime_romfs_open(&h,"rom:/absent",2)==UNSUPPORTED,"reject write open");
- printf("{\"status\":\"pass\",\"files\":%llu,\"sampled_files\":%u,\"overlays\":%u,\"read_digest\":\"%016llx\",\"scope\":\"read-only mount/open/size/read/EOF, verified overlays; no game startup\"}\n",(unsigned long long)file_count,count,noverlay,(unsigned long long)sum);
+ /* Add-on content: listed in index order, each mounted, sampled like the RomFS, then unmounted. */
+ int listed[NAOC];unsigned aoc_count=0;need(runtime_aoc_list(listed,0,NAOC)==runtime_aoc_count(),"list add-on content");
+ need(mount_aoc("aoc",NAOC*1000,NULL,0)==NOT_FOUND,"absent add-on content index");
+ for(unsigned k=0;k<naoc;k++){
+  need(listed[k]==aoc[k].index&&(!k||listed[k-1]<listed[k]),"add-on content list order");
+  need(mount_aoc("aoc",aoc[k].index,NULL,0)==0&&runtime_romfs_owns("aoc:/x"),"mount add-on content");
+  const View *v=&aoc[k].view;int type=-1;
+  for(uint64_t i=0;i<v->count;i+=v->count/16+1){Entry e=ventry(v,i);char p[4096];need(snprintf(p,sizeof(p),"aoc:/%s",vname(v,e))<(int)sizeof(p),"probe add-on content path");uint64_t n=0;int64_t size;
+   need(!runtime_romfs_open(&h,p,1)&&!runtime_romfs_size(&size,h)&&(uint64_t)size==e.size,"probe add-on content open/size");need(!runtime_romfs_read(&n,h,0,buffer,sizeof(buffer))&&n==(e.size<sizeof(buffer)?e.size:sizeof(buffer)),"probe add-on content read");
+   uint8_t direct[257];need(pread(aoc[k].fd,direct,n,(off_t)e.offset)==(ssize_t)n&&!memcmp(direct,buffer,n),"probe add-on content bytes");runtime_romfs_close(h);aoc_count++;}
+  char first[4096];need(v->count&&snprintf(first,sizeof(first),"aoc:/%s",vname(v,ventry(v,0)))<(int)sizeof(first),"probe add-on content first file");
+  char *slash=strchr(first+5,'/');if(slash){*slash=0;need(!runtime_romfs_entry_type(&type,first)&&type==0,"add-on content directory entry");*slash='/';}
+  need(runtime_romfs_unmount("aoc")&&!runtime_romfs_owns("aoc:/x")&&runtime_romfs_open(&h,first,1)==NOT_FOUND,"unmount add-on content");}
+ printf("{\"status\":\"pass\",\"files\":%llu,\"sampled_files\":%u,\"overlays\":%u,\"aoc\":%u,\"aoc_sampled_files\":%u,\"read_digest\":\"%016llx\",\"scope\":\"read-only mount/open/size/read/EOF, verified overlays, add-on content mount/list/unmount; no game startup\"}\n",(unsigned long long)rom.count,count,noverlay,naoc,aoc_count,(unsigned long long)sum);
 }

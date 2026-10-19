@@ -187,6 +187,38 @@ def record_offset(record):
     return record['nca_offset'] if 'nca_offset' in record else record['xci_offset']
 
 
+def nca_pfs0(f, record, hdr, ctr_key, i):
+    """The files of NCA section i if it is a hash-verified PFS0 (ExeFS, CNMT), else None."""
+    start, end = struct.unpack_from('<II', hdr, 0x240 + 16 * i)
+    if not start:
+        return None
+    fs = hdr[0x400 + 512 * i:0x600 + 512 * i]
+    require(hashlib.sha256(fs).digest() == hdr[0x280 + 32 * i:0x2A0 + 32 * i], 'FS header hash mismatch')
+    if fs[2:4] != b'\x01\x02':
+        return None
+    require(fs[4] == 3, 'Only AES-CTR PFS0 sections are supported')
+    blocksize, levels = struct.unpack_from('<II', fs, 0x28)
+    hashoff, hashsize, pfsoff, pfssize = struct.unpack_from('<QQQQ', fs, 0x30)
+    secstart, secsize = start * 512, (end - start) * 512
+    require(levels == 2 and blocksize > 0 and pfssize <= 512 * 1024 * 1024, 'Unsupported PFS0 hash layout')
+
+    def section_read(relative, size):
+        require(relative >= 0 and relative + size <= secsize, 'Section read out of bounds')
+        absolute = secstart + relative
+        aligned = absolute & ~15
+        iv = fs[0x140:0x148][::-1] + (aligned // 16).to_bytes(8, 'big')
+        data = read_at(f, record_offset(record) + aligned, size + absolute - aligned)
+        return decrypt(ctr_key, modes.CTR(iv), data)[absolute - aligned:]
+
+    hashes = section_read(hashoff, hashsize)
+    require(hashlib.sha256(hashes).digest() == fs[8:40], 'PFS0 hash-table mismatch')
+    pfs = section_read(pfsoff, pfssize)
+    for index, pos in enumerate(range(0, pfssize, blocksize)):
+        expected = hashes[index * 32:(index + 1) * 32]
+        require(hashlib.sha256(pfs[pos:pos + blocksize]).digest() == expected, f'PFS0 block hash mismatch: {index}')
+    return [(name, pfs[off:off + size]) for name, off, size in partition_entries(io.BytesIO(pfs), 0, len(pfs))]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('game', type=Path, help='base game 1.0.0 (.xci or .nsp)')
@@ -205,36 +237,9 @@ def main():
         record, hdr = program_nca(records, update=args.update, title_id=args.title_id)
         ctr_key = nca_ctr_key(hdr, keys, tickets)
         for i in range(4):
-            start, end = struct.unpack_from('<II', hdr, 0x240 + 16 * i)
-            if not start:
+            files = nca_pfs0(f, record, hdr, ctr_key, i)
+            if files is None:
                 continue
-            fs = hdr[0x400 + 512 * i:0x600 + 512 * i]
-            require(hashlib.sha256(fs).digest() == hdr[0x280 + 32 * i:0x2A0 + 32 * i], 'FS header hash mismatch')
-            if fs[2:4] != b'\x01\x02':
-                continue
-            require(fs[4] == 3, 'Only AES-CTR ExeFS is supported')
-            blocksize, levels = struct.unpack_from('<II', fs, 0x28)
-            hashoff, hashsize, pfsoff, pfssize = struct.unpack_from('<QQQQ', fs, 0x30)
-            secstart, secsize = start * 512, (end - start) * 512
-            require(levels == 2 and blocksize > 0 and pfssize <= 512 * 1024 * 1024, 'Unsupported ExeFS hash layout')
-
-            def section_read(relative, size):
-                require(relative >= 0 and relative + size <= secsize, 'Section read out of bounds')
-                absolute = secstart + relative
-                aligned = absolute & ~15
-                iv = fs[0x140:0x148][::-1] + (aligned // 16).to_bytes(8, 'big')
-                data = read_at(f, record_offset(record) + aligned, size + absolute - aligned)
-                return decrypt(ctr_key, modes.CTR(iv), data)[absolute - aligned:]
-
-            hashes = section_read(hashoff, hashsize)
-            require(hashlib.sha256(hashes).digest() == fs[8:40], 'ExeFS hash-table mismatch')
-            pfs = section_read(pfsoff, pfssize)
-            for index, pos in enumerate(range(0, pfssize, blocksize)):
-                expected = hashes[index * 32:(index + 1) * 32]
-                require(hashlib.sha256(pfs[pos:pos + blocksize]).digest() == expected,
-                        f'ExeFS block hash mismatch: {index}')
-            files = [(name, pfs[off:off + size]) for name, off, size in
-                     partition_entries(io.BytesIO(pfs), 0, len(pfs))]
             require(any(name == 'main.npdm' for name, _ in files), 'PFS0 is not ExeFS')
             args.output.mkdir(parents=True)
             extracted = []

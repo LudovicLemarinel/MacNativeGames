@@ -177,10 +177,14 @@ void runtime_guest_resident(uint64_t *resident,uint64_t *dirty,uint64_t *compres
 }
 static void host_diag_init(void) { fprintf(stderr,"[totk] native diagnostics initialized\n"); }
 static void host_oe_init(void) { fprintf(stderr,"[totk] application environment: local macOS process\n"); }
-static void host_aoc_init(void) { fprintf(stderr,"[totk] add-on content: no DLC\n"); }
-static int host_aoc_count(void) { return 0; }
-static int host_aoc_list(int *out,int offset,int count) {
- (void)out;if(offset<0||count<0)runtime_fail("invalid add-on content list range");return 0;
+/* Add-on content: the DLC the build packaged and verified (romfs.c). */
+static void host_aoc_init(void) { fprintf(stderr,"[totk] add-on content: %d DLC\n",runtime_aoc_count()); }
+static int host_aoc_count(void) { return runtime_aoc_count(); }
+static int host_aoc_list(int *out,int offset,int count) { return runtime_aoc_list(out,offset,count); }
+/* On the console an error dialog, after which the game runs without the DLC; here the packaged DLC is wrong for the
+   game version, which the build should have refused. */
+static void host_aoc_version_error(void) {
+ runtime_fail("the game refuses the packaged DLC version (nn::err::ShowUnacceptableAddOnContentVersionError): rebuild with the DLC for this game version");
 }
 static void host_error_init(void) { fprintf(stderr,"[totk] error contexts: local diagnostics\n"); }
 static void host_fs_init(void) { runtime_fs_init(); }
@@ -252,6 +256,7 @@ void *runtime_override(const char *name) {
   {"_ZN2nn2oe28SetResumeNotificationEnabledEb",resume_enabled},{"_ZN2nn2oe42SetOperationModeChangedNotificationEnabledEb",operation_enabled},{"_ZN2nn2oe44SetPerformanceModeChangedNotificationEnabledEb",performance_enabled},
   {"nndiagStartup",host_diag_init},{"_ZN2nn2oe10InitializeEv",host_oe_init},{"_ZN2nn3aoc10InitializeEv",host_aoc_init},
   {"_ZN2nn3aoc17CountAddOnContentEv",host_aoc_count},{"_ZN2nn3aoc16ListAddOnContentEPiii",host_aoc_list},
+  {"_ZN2nn3err40ShowUnacceptableAddOnContentVersionErrorEv",host_aoc_version_error},
   {"_ZN2nn3err26InitializeContextWriterApiEv",host_error_init},{"_ZN2nn2fs24InitializeForApplicationEv",host_fs_init},
   {"_ZN2nn4pctl10InitializeEv",host_pctl_init},{"_ZN2nn4diag34InitializeApplicationAbortObserverEv",host_abort_init},
   {"_ZN2nn2pl11BeginVrModeEv",host_vr_mode},{"_ZN2nn2pl9EndVrModeEv",host_vr_mode},{"_ZN2nn2pl8IsVrModeEv",host_is_vr_mode},

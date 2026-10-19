@@ -6,6 +6,7 @@ void *runtime_fs_host_override(const char *name);
 
 /* romfs.c */
 int runtime_romfs_owns(const char *path);
+int runtime_romfs_unmount(const char *name);
 int runtime_romfs_handle(uint64_t h);
 unsigned runtime_romfs_open(uint64_t *out, const char *path, int mode);
 unsigned runtime_romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buffer, uint64_t size);

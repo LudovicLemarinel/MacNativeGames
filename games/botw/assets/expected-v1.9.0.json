@@ -31,5 +31,18 @@
     "subsdk1": "a1b399f06db89bac005e8c7d8ce3475f931a9cdff6b7fc3509b9427e0a47be41",
     "subsdk2": "e56eec1a58d1fa53779469e6eea36a795c0deac90bbf25b54b97c44ed195bd65",
     "subsdk3": "2f344d84badf826937317e033b47f32bb2e1e8b7856553ce7356616268b5e238"
+  },
+  "aoc": {
+    "_comment": "DLC (add-on content) RomFS images, all six IVFC levels verified. Index = title ID - 01007EF00011F000. The game lists two DLC and mounts index 1 as aoc: (the Expansion Pass data); index 2 holds only System/AocVersion.txt and must be present for the game to use index 1.",
+    "01007EF00011F001": {
+      "version": 196608,
+      "size": 1390370680,
+      "sha256": "6fc0b5f075bd52ab5390e98b4c07ffccd1db5efbcfd514003ded703fcdd2d42b"
+    },
+    "01007EF00011F002": {
+      "version": 196608,
+      "size": 648,
+      "sha256": "a66389137e8505994bba3c5930e709c38d95579dae4554ab5a93ee9e519ebd20"
+    }
   }
 }

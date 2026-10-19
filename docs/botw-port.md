@@ -6,7 +6,41 @@ merges and verifies its RomFS, then stops. There is no BOTW runtime, app, graphi
 ```sh
 python3.14 build_app.py --game botw "<BOTW base 1.0.0>.nsp" --update "<BOTW 1.9.0 update>.nsp" \
     -k <prod.keys> --firmware <unpacked firmware NCA directory>
+# or, from a folder holding the base game, the update and possibly other versions and DLC:
+python3.14 build_app.py --game botw --data-dir "<folder>" -k <prod.keys> --firmware <unpacked firmware NCA directory>
 ```
+
+With `--data-dir`, packages are identified by their CNMT and every NCA of the BOTW packages is hashed against it before
+anything is extracted (17.9 GB in about 10 s on an M5, then cached), so a damaged dump like the one below is named at
+once. Other update versions (such as 1.6.0) are listed and ignored. Without `--data-dir`, give each DLC with `--dlc`.
+
+## DLC (add-on content)
+
+| Package | Index | Content | RomFS |
+| --- | --- | --- | --- |
+| `01007EF00011F001` v196608 | 1 | the Expansion Pass data (version 3.0): `Pack/Dungeon120…136`, `FinalTrial`, `Remains*`, `AocMainField`, `Map/AocField`, 6 movies, voices | 7,094 files, 1,390,370,680 bytes, `6fc0b5f0…d42b` |
+| `01007EF00011F002` v196608 | 2 | only `System/AocVersion.txt` = `3.0` | 648 bytes, `a6638913…bd20` |
+
+What 1.9.0 does with them (its function at `main+0x10cc2d0`): `nn::aoc::ListAddOnContent(list, 0, 2)` must return
+**exactly two** entries, otherwise the DLC is ignored; if index 1 is listed it calls
+`QueryMountAddOnContentCacheSize(&size, 1)` and `MountAddOnContent("aoc", 1, cache, size)` and reads `aoc:/…` (its
+`Aoc/0010/` paths); index 3 only sets a flag. Index 2 is never mounted, but without it index 1 is not used either, so
+both packages are needed. 407 paths of the DLC also exist in the game's RomFS (`Map/MainField/*`): the game picks the
+`aoc:` copy itself, so the DLC is a second mount, never merged into `romfs.bin`.
+
+Build (`step_dlc`): each DLC is identified by its CNMT and hashed, its Data NCA's RomFS is extracted with all six IVFC
+levels verified (`games/totk/scripts/extract_aoc_romfs.py`, about 2 s for the 1.39 GB image) and must match the image
+recorded in `expected-v1.9.0.json` (`aoc`); an unrecorded DLC version is listed and left out.
+`extracted/v190/aoc/manifest.tsv` lists the packaged ones and the app carries them.
+
+Runtime (`romfs.c`): the manifest's images are hashed at the first `nn::aoc` call (a record of the full hash is then
+reused, like the game's RomFS, in `TOTK_ROMFS_PROOF_DIR`); `nn::aoc::CountAddOnContent` / `ListAddOnContent` report
+these indices; `nn::fs::MountAddOnContent` mounts one as a second read-only volume and `nn::fs::Unmount` releases it;
+`nn::err::ShowUnacceptableAddOnContentVersionError` stops with a message. `TOTK_AOC=<folder>` uses another manifest
+folder, `TOTK_AOC=0` none. `totk-native-v190 rewritten/v190 probe-fs` lists, mounts, reads (byte-compared with the
+image) and unmounts each DLC: pass (2026-10-19, 17 sampled DLC files); a damaged image stops the start.
+
+Not checked yet: the game itself with the DLC (its title menu, the Master Trials and Champions' Ballad content).
 
 Merged RomFS (2026-10-19, M4): 15,132,662,100 bytes, SHA-256 `826b373b…ae429dad`, all six IVFC levels verified, about
 two minutes. Its 41,062 files are indexed for the runtime (`extracted/v190/romfs/runtime-index.bin`).
@@ -92,7 +126,7 @@ LLVM_BIN=/opt/homebrew/opt/llvm/bin DM_VCACHE=$W/llvm-cache $W/venv/bin/python t
     --jobs 6 --min-eff 2 --max-extra 16 --mutate 300 --tsv $W/main-equivalence.tsv
 ```
 
-The equivalence run took a few minutes on an M4 with 6 jobs. The DLC pack was not examined.
+The equivalence run took a few minutes on an M4 with 6 jobs.
 
 ## Runtime profile and first boot
 

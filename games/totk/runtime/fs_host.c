@@ -173,7 +173,7 @@ static void unmount(const char *name) {
     pthread_mutex_lock(&lock);
     for (int i = 0; i < 16; i++) if (mounts[i].kind && !strcmp(mounts[i].name, name)) { mounts[i].kind = M_FREE; pthread_mutex_unlock(&lock); return; }
     pthread_mutex_unlock(&lock);
-    if (!runtime_romfs_owns(name)) runtime_fail("unmount of unknown fs mount");
+    if (!runtime_romfs_unmount(name)) runtime_fail("unmount of unknown fs mount");
 }
 static unsigned commit(const char *name) {
     pthread_mutex_lock(&lock); int found = 0, save = 0;

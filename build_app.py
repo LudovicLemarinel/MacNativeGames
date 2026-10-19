@@ -2,10 +2,12 @@
 """MacNativeGames: turn your own XCI or NSP into a native Mac app (macOS only).
 
     python3 build_app.py <game.xci|game.nsp> -k <prod.keys> [-o "<output>.app"] [--work <folder>]
+    python3 build_app.py --data-dir <folder of .nsp/.nsz/.xci> -k <prod.keys> [--game botw]
 
 Supported: TOTK base 1.0.0 (0100F2C0115B6000), XCI or NSP; optional --update with a supported cumulative update.
 NSPs need common tickets (unless rights-free) and a separate shared-font source. No iPhone/iOS builds are supported.
-In preparation: --game botw with BOTW base 1.0.0 and --update 1.9.0 (no game patches or startup shader seed yet).
+In preparation: --game botw with BOTW base 1.0.0 and --update 1.9.0 (no game patches or startup shader seed yet), and
+its DLC with --dlc (or found with --data-dir).
 Nothing from the game is in this repository; everything is made from your files on your Mac. Key values are never printed.
 
 Steps (each one checked against games/totk/assets/expected-v<version>.json, so a damaged dump or another version stops the
@@ -260,6 +262,72 @@ def identify_update(tree, game, keys, logs):
     staging.rmdir()
     say(f'update identified by verified ExeFS hashes: {VERSIONS[version]["display_version"]}')
     return version, source
+
+
+def scan_data_dir(tree, folder, keys, logs):
+    """--data-dir: identify every package of the folder by its CNMT (scripts/identify_packages.py), hash the NCAs of
+    the selected game's packages against their CNMT records, and choose its base game, the newest supported update and
+    its DLC. File names are never used."""
+    py, cache = tree / '.venv/bin/python', tree / 'extracted/packages.json'
+    say(f'identifying the packages in {folder}')
+    found = tree / 'extracted/packages-found.json'
+    run([py, 'scripts/identify_packages.py', folder, '--keys', keys, '--cache', cache, '--json', found],
+        logs / 'identify-packages.log', cwd=tree)
+    title = SELECTED['title_id']
+    mine = [p['file'] for p in json.loads(found.read_text())
+            if any(m['application_id'] == title for m in p['metas'])]
+    if mine:
+        say(f'   verifying the {SELECTED["name"]} packages against their content metadata')
+        run([py, 'scripts/identify_packages.py', *mine, '--keys', keys, '--verify', '--cache', cache, '--json', found],
+            logs / 'verify-packages.log', cwd=tree)
+    packages = json.loads(found.read_text()) if mine else []
+    return select_packages(packages, json.loads(cache.read_text()), folder)
+
+
+def select_packages(packages, everything, folder):
+    """(base, update or None, [DLC]) of SELECTED from identified packages; prints what each file is and why it is or
+    is not used. packages: the selected game's verified packages; everything: all identified packages of the folder."""
+    title = SELECTED['title_id']
+    supported = {VERSIONS[v]['version']: v for v in SELECTED['updates']}
+    usable = [p for p in packages if not p['problems'] and len(p['metas']) == 1]
+    def meta(p):
+        return p['metas'][0]
+    bases = sorted((p for p in usable if meta(p)['type'] == 'base' and meta(p)['title_id'] == title),
+                   key=lambda p: (p['container'] != 'xci', p['file']))   # an XCI also carries the shared fonts
+    updates = sorted((p for p in usable if meta(p)['type'] == 'update' and meta(p)['version'] in supported),
+                     key=lambda p: -meta(p)['version'])
+    dlcs = {}
+    for p in sorted((p for p in usable if meta(p)['type'] == 'dlc'), key=lambda p: meta(p)['version']):
+        dlcs[meta(p)['title_id']] = p   # the newest version of each DLC
+    chosen = {id(p): role for p, role in [(bases[0] if bases else None, 'base game'),
+                                          (updates[0] if updates else None, 'update')] if p}
+    chosen.update({id(p): 'DLC' for p in dlcs.values()})
+    by_file = {p['file']: p for p in packages}
+    for p in sorted(everything, key=lambda p: p['file']):
+        if Path(p['file']).parent != folder:
+            continue
+        p = by_file.get(p['file'], p)
+        what = '; '.join(f'{m["type"]} {m["title_id"]} v{m["version"]}' for m in p['metas']) or 'not identified'
+        if p['problems']:
+            why = 'NOT USED: ' + '; '.join(p['problems'])
+        elif id(p) in chosen:
+            why = 'used as ' + chosen[id(p)]
+        elif not any(m['application_id'] == title for m in p['metas']):
+            why = 'another game'
+        elif len(p['metas']) > 1:
+            why = 'not used: combined packages are unsupported'
+        elif meta(p)['type'] == 'update' and meta(p)['version'] not in supported:
+            why = 'not used: unsupported update version (supported: ' + \
+                  ', '.join(VERSIONS[v]['display_version'] for v in SELECTED['updates']) + ')'
+        else:
+            why = 'not used: duplicate'
+        say(f'   {Path(p["file"]).name}: {what}, {why}')
+    if not bases:
+        others = sorted(f'{g["name"]} (--game {k})' for k, g in GAMES.items() if g is not SELECTED and any(
+            m['type'] == 'base' and m['title_id'] == g['title_id'] for p in everything for m in p['metas']))
+        raise BuildError(f'no verified {SELECTED["name"]} base game in {folder}' +
+                         (f'; this folder has {", ".join(others)}' if others else ''))
+    return Path(bases[0]['file']), Path(updates[0]['file']) if updates else None, [Path(p['file']) for p in dlcs.values()]
 
 
 def font_report(folder):
@@ -537,6 +605,55 @@ def step_update_data(tree, game, update, keys, logs, *, version='v112'):
             logs/(version+'-'+script+'.log'), cwd=tree)
 
 
+def step_dlc(tree, dlcs, keys, logs, *, version):
+    """DLC: each package identified by its CNMT and hashed, its RomFS extracted with all IVFC levels verified and
+    checked against the image recorded for this game version. extracted/<version>/aoc/manifest.tsv lists them for the
+    runtime (romfs.c), which offers only these to the game; it is rewritten on every build, empty without DLC."""
+    py, folder = tree / '.venv/bin/python', tree / f'extracted/{version}/aoc'
+    recorded = {k: v for k, v in VERSIONS[version].get('aoc', {}).items() if not k.startswith('_')}
+    rows = []
+    if dlcs:
+        found = tree / 'extracted/dlc-packages.json'
+        run([py, 'scripts/identify_packages.py', *dlcs, '--keys', keys, '--verify', '--cache', tree / 'extracted/packages.json',
+             '--json', found], logs / 'identify-dlc.log', cwd=tree)
+        titles = set()
+        for package in json.loads(found.read_text()):
+            name, metas = Path(package['file']).name, package['metas']
+            if package['problems'] or len(metas) != 1 or metas[0]['type'] != 'dlc' or metas[0]['application_id'] != SELECTED['title_id']:
+                raise BuildError(f'{name} is not a verified {SELECTED["name"]} DLC: ' +
+                                 ('; '.join(package['problems']) or ', '.join(f'{m["type"]} {m["title_id"]}' for m in metas)))
+            title, dlc_version = metas[0]['title_id'], metas[0]['version']
+            if title in titles:
+                raise BuildError(f'{name}: DLC {title} given twice')
+            titles.add(title)
+            want = recorded.get(title)
+            if not want or want['version'] != dlc_version:
+                say(f'   {name}: DLC {title} v{dlc_version} has no recorded image for {SELECTED["name"]} '
+                    f'{VERSIONS[version]["display_version"]}; not packaged')
+                continue
+            out = folder / title
+            try:
+                report = json.loads((out / 'index.json').read_text())
+                valid = (report['status'] == 'pass' and report['romfs_sha256'] == want['sha256'] and
+                         (out / 'romfs.bin').stat().st_size == want['size'] and (out / 'runtime-index.bin').is_file())
+            except (OSError, ValueError, KeyError):
+                valid = False
+            if not valid:
+                if out.exists():
+                    shutil.rmtree(out)
+                say(f'2/4 DLC: extracting {title} and verifying all IVFC levels')
+                run([py, 'scripts/extract_aoc_romfs.py', package['file'], '--keys', keys, '--title-id', title, '--output', out],
+                    logs / f'dlc-{title}.log', cwd=tree)
+                report = json.loads((out / 'index.json').read_text())
+                check(f'DLC {title} RomFS', report['romfs_sha256'], want['sha256'])
+            index = int(title, 16) - (int(SELECTED['title_id'], 16) + 0x1000)   # nn::aoc's index: from the DLC base ID
+            rows.append(f'{index}\t{title}\t{want["size"]}\t{want["sha256"]}\t{sha256(out / "runtime-index.bin")}\n')
+            say(f'   DLC {title} (index {index}, {len(report["files"])} files) packaged')
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / 'manifest.tsv').write_text('# index, title ID, RomFS size, RomFS SHA-256, runtime-index SHA-256 (romfs.c)\n' +
+                                         ''.join(sorted(rows, key=lambda r: int(r.split('\t')[0]))))
+
+
 def build_spirv_cross(tree, logs):
     """The spirv-cross program with clang (the sources and flags of SPIRV-Cross's CMake Release build of it)."""
     src, out = tree / 'tooling/spirv-cross', tree / 'build/spirv-cross'
@@ -678,6 +795,13 @@ def step_app(tree, out, logs, *, version="v0"):
     clone(tree / 'prebuilt/macos-arm64/totk_xlate', res / 'build/shader-service/totk_xlate')   # where totk_shader_rt.m looks for it
     for rel in (f'extracted/{version}/romfs-patches', f'extracted/{version}/romfs-patches-out', 'extracted/firmware/shared-fonts'):
         copy_tree(tree / rel, res / rel)
+    aoc = f'extracted/{version}/aoc'   # the DLC step_dlc listed (none without its manifest)
+    if (tree / aoc / 'manifest.tsv').is_file():
+        clone(tree / aoc / 'manifest.tsv', res / aoc / 'manifest.tsv')
+        for line in (tree / aoc / 'manifest.tsv').read_text().splitlines():
+            if line and not line.startswith('#'):
+                for name in ('romfs.bin', 'runtime-index.bin'):
+                    clone(tree / aoc / line.split('\t')[1] / name, res / aoc / line.split('\t')[1] / name)
     seed = tree/f'build/shader-seed/{version}'
     if not SELECTED['seed']:
         # TOTK's PSO list names TOTK shaders only: the app gets an empty list, and play collects its own (pso_collected.tsv)
@@ -732,8 +856,13 @@ def step_app(tree, out, logs, *, version="v0"):
 def parse_args(argv):
     ap = argparse.ArgumentParser(description='Build one native macOS app from TOTK base 1.0.0 (XCI/NSP), optionally with the separate 1.1.2 or 1.4.3 update.',
                                  epilog='example: python3 build_app.py ~/Games/totk.xci -k ~/keys/prod.keys')
-    ap.add_argument('game_file', metavar='game', type=Path, help='the game file (.xci or .nsp), base game 1.0.0')
+    ap.add_argument('game_file', metavar='game', type=Path, nargs='?', help='the game file (.xci or .nsp), base game 1.0.0')
+    ap.add_argument('--data-dir', type=Path, help='a folder of .nsp/.nsz/.xci files instead of game and --update: each one '
+                    'is identified by its content metadata and verified, and the base game, the newest supported update '
+                    'and the DLC of --game are chosen')
     ap.add_argument('--update', type=Path, help='separate supported cumulative update NSP/NSZ; outputs the same single app')
+    ap.add_argument('--dlc', type=Path, action='append', default=[],
+                    help='a DLC NSP of the game (repeatable); with --data-dir, the folder\'s DLC are used')
     ap.add_argument('-k', '--keys', type=Path, required=True, help='your prod.keys')
     ap.add_argument('-o', '--out', type=Path, help=f'the app to write (default: "{APP_NAME}.app" next to the game file)')
     ap.add_argument('--work', type=Path, help='work folder (default: TOTK_build or BOTW_build next to the game file)')
@@ -750,22 +879,46 @@ def main(argv):
     global SELECTED
     args = parse_args(argv)
     SELECTED = GAMES[args.game]
-    game, keys = args.game_file.expanduser().resolve(), args.keys.expanduser().resolve()
-    if not game.is_file():
-        raise BuildError(f'no such file: {game}')
+    keys = args.keys.expanduser().resolve()
     if not keys.is_file():
         raise BuildError(f'no such file: {keys}')
-    if not SELECTED['base_code'] and not args.update:
-        supported = ' or '.join(VERSIONS[v]['display_version'] for v in SELECTED['updates'])
-        raise BuildError(f'{SELECTED["name"]} needs its base game and --update {supported}: only that version is a port target')
-    out = (args.out.expanduser().resolve() if args.out else game.parent / f'{SELECTED["name"]}.app')
-    work = (args.work.expanduser().resolve() if args.work else game.parent / SELECTED['work'])
+    if args.data_dir:
+        if args.game_file or args.update or args.dlc:
+            raise BuildError('--data-dir replaces the game file, --update and --dlc: give one or the other')
+        folder = args.data_dir.expanduser().resolve()
+        if not folder.is_dir():
+            raise BuildError(f'no such folder: {folder}')
+        place = folder
+    else:
+        if not args.game_file:
+            raise BuildError('give the base game file, or --data-dir <folder of game files>')
+        game = args.game_file.expanduser().resolve()
+        if not game.is_file():
+            raise BuildError(f'no such file: {game}')
+        place = game.parent
+    out = (args.out.expanduser().resolve() if args.out else place / f'{SELECTED["name"]}.app')
+    work = (args.work.expanduser().resolve() if args.work else place / SELECTED['work'])
     if out.suffix != '.app':
         raise BuildError(f'the output must end in .app: {out}')
+    logs = work / 'logs'
+    py = tree = None
+    if args.data_dir:
+        # Identifying the packages needs the build tools' Python environment (AES), so the work folder comes first.
+        py = prerequisites(args)
+        tree = prepare_work(work, py, logs)
+        game, update, dlcs = scan_data_dir(tree, folder, keys, logs)
+    else:
+        update = args.update.expanduser().resolve() if args.update else None
+        dlcs = [p.expanduser().resolve() for p in args.dlc]
+        missing = [str(p) for p in dlcs if not p.is_file()]
+        if missing:
+            raise BuildError(f'no such DLC file: {", ".join(missing)}')
+    if not SELECTED['base_code'] and not update:
+        supported = ' or '.join(VERSIONS[v]['display_version'] for v in SELECTED['updates'])
+        raise BuildError(f'{SELECTED["name"]} needs its base game and update {supported}: only that version is a port target')
     kind = input_kind(game)
     if kind not in ('xci', 'nsp'):
         raise BuildError('the base game must be an uncompressed XCI or NSP; NSZ is supported for update packages')
-    update = args.update.expanduser().resolve() if args.update else None
     if update and (not update.is_file() or input_kind(update) not in ('nsp', 'nsz')):
         raise BuildError('--update must be a separate cumulative NSP or NSZ')
     version = 'v0'
@@ -778,17 +931,16 @@ def main(argv):
     if kind == 'nsp' and not (firmware or shared_fonts or fonts_valid(work / 'totk/extracted/firmware/shared-fonts')):
         raise BuildError('NSP files do not include system shared fonts. Supply --firmware <unpacked firmware NCA directory> '
                          'or --shared-fonts <previously extracted font directory>; valid fonts in --work are also reused.')
-    py = prerequisites(args)
+    py = py or prerequisites(args)
     free = shutil.disk_usage(work.parent if work.parent.exists() else game.parent).free / 2**30
     say(f'work folder {work} ({free:.0f} GB free on its volume)')
     if update and free < 40 and not (work / 'totk/extracted/v0/romfs/romfs.bin').exists():
         raise BuildError('needs about 40 GB free for a fresh base + update build (19 GB extra with base data cached)')
     if free < 25 and not (work / 'totk/extracted/v0/romfs/romfs.bin').exists():
         raise BuildError('needs about 25 GB free for the work folder (the app itself is an APFS clone of it when on the same volume)')
-    logs = work / 'logs'
     env = dict(os.environ, PATH=os.pathsep.join(TOOL_PATHS + [os.environ.get('PATH', '/usr/bin:/bin:/usr/sbin:/sbin')]))
     t0 = time.time()
-    tree = prepare_work(work, py, logs)
+    tree = tree or prepare_work(work, py, logs)
     if update:
         version, update = identify_update(tree, update, keys, logs)
     if SELECTED['base_code']:
@@ -800,6 +952,7 @@ def main(argv):
     step_data(tree, game, keys, logs, firmware=firmware, shared_fonts=shared_fonts)
     if update:
         step_update_data(tree, game, update, keys, logs, version=version)
+    step_dlc(tree, dlcs, keys, logs, version=version)
     step_shaders(tree, logs, version=version)
     step_shader_libs(tree, logs, version=version)
     step_binary(tree, game, keys, env, logs, version=version)
