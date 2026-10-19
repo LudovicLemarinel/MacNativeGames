@@ -1,0 +1,31 @@
+{
+  "_comment": "BOTW 1.9.0 code bytes and verified rewrite. sdk, subsdk0 and rtld are byte-identical to TOTK 1.4.3 (NintendoSDK 20.5.22), and so are their rewrites. The merged RomFS is not recorded yet. No runtime, gameplay or graphics validation has been done.",
+  "title_id": "01007EF00011E000",
+  "update_title_id": "01007EF00011E800",
+  "version": 1114112,
+  "display_version": "1.9.0",
+  "sdk_version": "20.5.22",
+  "exefs_sha256": {
+    "main": "f6f0b20bb1f2b67d164c24871cd473147eef1d285f12e7bd492e3126c6022e27",
+    "main.npdm": "38a7484e19b7a51dffda5e58c5c95a54f72c4d04bdf4bb76cbae81611fa29565",
+    "rtld": "49308064fddb52dfe9140c11a32cc6333a0917546c871967d013dcb076402817",
+    "sdk": "1d187f29784cd0af46e9e123fc2a62c77b3b07c5a39c8633d90d6c80de64e4ad",
+    "subsdk0": "767c35bcd7d23e78f9063c69b638290b8b83f91e839beb10799e6576960179b1"
+  },
+  "rewritten_sha256": {
+    "main.patched.bin": "6d48bff1b7f2692bd4f2efd3316b564877c50a10c6145610cf9a779b220538c6",
+    "sdk.patched.bin": "4d625d9baaebe60d38a00de1b8023fde7fb856d460a08433809670179483ca24",
+    "subsdk0.patched.bin": "0322958960fb205a8e108476f9e6b344e90cd5526f3e2c83503b3261ff2518e2"
+  },
+  "base_exefs_sha256": {
+    "_comment": "Base game 1.0.0 (NintendoSDK 0.12.14, six modules, NVN in subsdk0). Required for the RomFS merge only; its code is not a port target.",
+    "main": "fa2541333fdb5a868a286ea138774d82d13a1b0b97988d7af6c60ed82d2b1c81",
+    "main.npdm": "27e604002489d5f3ef5017cebedfd2c13e3eec87825690cdd658b2b9086c557e",
+    "rtld": "2bf1918e54e3d6378f150e45a264c151558198703a778408db5ac26263a3a362",
+    "sdk": "0abff9d26d975cb17c24ddfecca488a4900e20ffd7ab9bb642e6df667dde9f31",
+    "subsdk0": "58b6791aff6e5cb509c5347c1dc41d01a32c0a298c7f5da0c88ea56fc8a6eb17",
+    "subsdk1": "a1b399f06db89bac005e8c7d8ce3475f931a9cdff6b7fc3509b9427e0a47be41",
+    "subsdk2": "e56eec1a58d1fa53779469e6eea36a795c0deac90bbf25b54b97c44ed195bd65",
+    "subsdk3": "2f344d84badf826937317e033b47f32bb2e1e8b7856553ce7356616268b5e238"
+  }
+}

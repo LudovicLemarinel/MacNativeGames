@@ -157,24 +157,28 @@ def nca_inventory(f, entries, keys):
     return records
 
 
-def program_nca(records, update=False):
+GAME_NAMES = {'0100F2C0115B6000': 'Tears of the Kingdom', '01007EF00011E000': 'Breath of the Wild'}
+
+
+def program_nca(records, update=False, title_id='0100F2C0115B6000'):
+    update_id = f'{int(title_id, 16) | 0x800:016X}'
     if update:
         programs = [(r, h) for r, h in records if r["content_type"] == 0]
         require(len(programs) == 1, "Expected one update Program NCA; combined packages are unsupported")
         record, hdr = programs[0]
-        require(record["title_id"] == "0100F2C0115B6000", "Update belongs to another game")
+        require(record["title_id"] == title_id, "Update belongs to another game")
         require(any(hdr[0x400 + i*512 + 4] == 4 for i in range(4)), "Expected a BKTR update, not a base game")
-        require(all(r["title_id"] in ("0100F2C0115B6000", "0100F2C0115B6800") for r, _ in records), "Mixed-title update package")
+        require(all(r["title_id"] in (title_id, update_id) for r, _ in records), "Mixed-title update package")
         return record, hdr
     # Update Program NCAs can retain the base title ID; their Meta NCA carries the update ID.
     metadata = [r for r, _ in records if r['content_type'] == 1]
-    require(len(metadata) <= 1 and all(r['title_id'] == '0100F2C0115B6000' for r in metadata),
+    require(len(metadata) <= 1 and all(r['title_id'] == title_id for r in metadata),
             'Expected base game metadata; updates, DLC and combined packages are unsupported')
     programs = [(r, h) for r, h in records if r['content_type'] == 0]
     require(len(programs) == 1, 'Expected one base Program NCA; updates, DLC and combined packages are unsupported')
     record, hdr = programs[0]
-    require(record['title_id'] == '0100F2C0115B6000',
-            'Expected Tears of the Kingdom base game 1.0.0; updates, DLC and other games are unsupported')
+    require(record['title_id'] == title_id,
+            f'Expected {GAME_NAMES.get(title_id, title_id)} base game 1.0.0; updates, DLC and other games are unsupported')
     return record, hdr
 
 
@@ -189,6 +193,8 @@ def main():
     parser.add_argument('--keys', required=True, type=Path)
     parser.add_argument('--update', action='store_true', help='extract update code; caller must verify supported version hashes')
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--title-id', default='0100F2C0115B6000', type=str.upper,
+                        help='base Program title ID (default: Tears of the Kingdom)')
     args = parser.parse_args()
     require(not args.output.exists(), 'Output already exists; choose a new directory')
     keys = load_keys(args.keys)
@@ -196,7 +202,7 @@ def main():
         kind, entries = container_entries(f, args.game.stat().st_size)
         tickets = common_tickets(f, entries)
         records = nca_inventory(f, entries, keys)
-        record, hdr = program_nca(records, update=args.update)
+        record, hdr = program_nca(records, update=args.update, title_id=args.title_id)
         ctr_key = nca_ctr_key(hdr, keys, tickets)
         for i in range(4):
             start, end = struct.unpack_from('<II', hdr, 0x240 + 16 * i)

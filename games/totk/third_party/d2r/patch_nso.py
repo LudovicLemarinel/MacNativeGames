@@ -634,6 +634,16 @@ SIGNED_TABLES = {'277178b7dba1b6d4949a84778d4abc58': {
     0x598ef4: (0x598ee4, 0x2d89038, (680,688,20,696,704,712,720,-5688,-2640), '12000010207ab0b85202008bdef747f940021fd6'),
     0x5f2a9c: (0x5f2a90, 0x2d892e0, (884,892,16,900,-6516), 'f0030f2a12000010207ab0b85202008b40021fd6'),
     0x6397d8: (0x6397cc, 0x2d88e7c, (1376,1384,16,1392,1400,1408,-7264), 'fb0301aa12000010207ab0b85202008b40021fd6'),
+},
+# BOTW 1.9.0: table-relative offsets whose base register (x26/x27) is set by an
+# earlier adrp/add pair; those two instructions are checked as well.
+'cd57b23fa4bbad65803d9788c01821ee': {
+    0x37df10: (0x16a78e4, 0x16a78e4, (-20093392,-20093004,-20092640,-20092348,-20089864,-20092160,-20091472,-20090868,-20090332),
+               '5f220071c86e0054527bb2b852021a8b40021fd6', (0x37dec0, '5a9900d0'), (0x37ded0, '5a932391')),
+    0x37ee84: (0x16a7908, 0x16a7908, (-20089472,-20089092,-20088736,-20088452,-20086004,-20088268,-20087588,-20086992,-20086464),
+               '5f220071e86c0054527bb2b852021a8b40021fd6', (0x37ee34, '5a9900b0'), (0x37ee44, '5a232491')),
+    0x37fdbc: (0x16a7950, 0x16a7950, (-20085648,-20085256,-20084888,-20084592,-20082084,-20084400,-20083704,-20083096,-20082556),
+               '5f220071e86f0054727bb2b852021b8b40021fd6', (0x37fd6c, '5b990090'), (0x37fd7c, '7b432591')),
 }}
 funcs = sorted({func_of(a) for a, (k, _) in kinds.items() if k == 'x18'})
 for fa, fb in funcs:
@@ -658,8 +668,9 @@ for fa, fb in funcs:
                         if width: break
                     break
             if not width and ins.address in SIGNED_TABLES.get(BUILD_ID, {}):
-                adrbase, table, offsets, dispatch = SIGNED_TABLES[BUILD_ID][ins.address]
+                adrbase, table, offsets, dispatch, *setup = SIGNED_TABLES[BUILD_ID][ins.address]
                 assert IMG[ins.address - 16:ins.address + 4].hex() == dispatch, f'signed-table dispatch {ins.address:x}'
+                assert all(IMG[at:at + 4].hex() == word for at, word in setup), f'signed-table base {ins.address:x}'
                 assert struct.unpack_from('<' + 'i' * len(offsets), IMG, table) == offsets, f'signed-table entries {ins.address:x}'
                 targets = [adrbase + offset for offset in offsets]
                 assert all(0 <= target < TEXT_END and target % 4 == 0 for target in targets)
