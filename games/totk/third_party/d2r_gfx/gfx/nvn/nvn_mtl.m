@@ -11804,7 +11804,7 @@ uint64_t mtl_udc_saved_bytes(void) { return g_udc_saved_bytes; }
 int mtl_has_window(void) { return front_metal_layer() != NULL; }
 int mtl_link_active(void) { return link_on(); }
 void mtl_link_pause(int on) { CAMetalDisplayLink *l = g_link; if (l) l.paused = on != 0; }   // 测试用（DM_TEST_BG）：模仿系统在后台停掉节拍回调 | For testing (DM_TEST_BG): imitates the system stopping the display-link callback in the background
-int mtl_link_wait_tick(uint64_t timeout_ns, unsigned frame_ticks) {
+int mtl_link_wait_tick(uint64_t timeout_ns, unsigned frame_ticks, uint64_t period_ns) {
     if (!mtl_link_active()) return 0;
     // 只在跑得比显示快时才等节拍：上一帧开工之后若已经过了节拍（这一帧已落后），立刻开工，不再白等到下一个节拍——
     // 否则帧时间略大于一个节拍时会「错过节拍 → 再等一整拍」，帧率直接锁到一半（Mac 有窗口负载下实测成串掉帧）
@@ -11819,13 +11819,22 @@ int mtl_link_wait_tick(uint64_t timeout_ns, unsigned frame_ticks) {
     /* TOTK: a frame occupies frame_ticks 60 Hz ticks (the game's present interval); the variable-frame-rate step
        advances game time by exactly that interval, so presenting faster would speed the game up. */
     const uint64_t step = (uint64_t)(g_dm_present_link == 2 ? 2 : 1) * (frame_ticks ? frame_ticks : 1);   // 一帧占几拍：游戏出图间隔 × 每个 60 Hz 节拍对应的节拍数（120 Hz 节拍为 2） | Ticks per frame: the game's present interval times display-link ticks per 60 Hz tick (2 at 120 Hz)
+    /* TOTK: and never longer than the frame's period plus an eighth (2026-10-19). ProMotion lowers the refresh rate when
+       the picture hardly moves; counted in ticks, BOTW's in-game menu in 30+30 (4 ticks at 120 Hz) took 80 to 140 ms a
+       frame (19 FPS, slow response). Past that deadline the frame starts as if the tick had come. */
+    static uint64_t started_ns;
+    uint64_t t0 = now_ns(), deadline = started_ns && period_ns ? started_ns + period_ns + period_ns / 8 : 0;
+    if (deadline && deadline - t0 < timeout_ns) timeout_ns = deadline > t0 ? deadline - t0 : 0;
     pthread_mutex_lock(&g_link_mu);
-    if (g_link_tick_n >= started_tick + step) { started_tick = g_link_tick_n; pthread_mutex_unlock(&g_link_mu); return 1; }
+    if (g_link_tick_n >= started_tick + step || (deadline && t0 >= deadline)) { started_tick = g_link_tick_n; started_ns = t0; pthread_mutex_unlock(&g_link_mu); return 1; }
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
     ts.tv_sec += timeout_ns / 1000000000ull; ts.tv_nsec += timeout_ns % 1000000000ull;
     if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-    while (g_link_tick_n < started_tick + step) if (pthread_cond_timedwait(&g_link_cv, &g_link_mu, &ts) == ETIMEDOUT) { pthread_mutex_unlock(&g_link_mu); return 0; }
-    started_tick = g_link_tick_n;
+    while (g_link_tick_n < started_tick + step) if (pthread_cond_timedwait(&g_link_cv, &g_link_mu, &ts) == ETIMEDOUT) {
+        if (deadline && now_ns() >= deadline) break;   /* the period is over: go, as if the tick had come */
+        pthread_mutex_unlock(&g_link_mu); return 0;
+    }
+    started_tick = g_link_tick_n; started_ns = now_ns();
     pthread_mutex_unlock(&g_link_mu); return 1;
 }
 
