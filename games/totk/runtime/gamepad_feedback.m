@@ -165,7 +165,7 @@ static void rumble_start(void) {
 
 /* ---- motion: the math is in runtime/motion_fusion.c ---- */
 static GCController *motionPad;  /* main queue */
-static void hid_motion_start(void);
+static void hid_motion_start(const char *why);
 static void hid_motion_stop(void);
 static uint64_t zeroSince;          /* the controller's handler queue */
 static BOOL motionSeen, hidAsked;   /* the controller's handler queue; reset on attach */
@@ -177,7 +177,7 @@ static void motion_sample(GCMotion *m) {   /* the controller's handler queue */
         if (!acc[0] && !acc[1] && !acc[2] && !gyro[0] && !gyro[1] && !gyro[2]) {
             uint64_t now = runtime_now_ns();
             if (!zeroSince) zeroSince = now;
-            else if (!hidAsked && now - zeroSince > 1000000000ull) { hidAsked = YES; dispatch_async(dispatch_get_main_queue(), ^{ hid_motion_start(); }); }
+            else if (!hidAsked && now - zeroSince > 1000000000ull) { hidAsked = YES; dispatch_async(dispatch_get_main_queue(), ^{ hid_motion_start("GameController's motion is all zeros"); }); }
             return;
         }
         motionSeen = YES;
@@ -195,7 +195,11 @@ static void motion_sample(GCMotion *m) {   /* the controller's handler queue */
    left, z out of the face, acceleration as the push against gravity (lying face up z = +1 G). Scales from the SPI
    calibration (the user calibration at 0x8026 when it has its 0xB2A1 magic, else the factory one at 0x6020), as SDL:
    G = raw * 4 / (sensitivity - origin), deg/s = (raw - origin) * 936 / (sensitivity - origin); until it arrives the
-   sensor's nominal ranges, 8 G and 2000 deg/s over 32768. */
+   sensor's nominal ranges, 8 G and 2000 deg/s over 32768.
+   The same controller does not always give zeros: in another session GameController delivered acceleration but a
+   rotation rate stuck near +0.002 rev/s however it was turned (BOTW: tilt aiming weak, turning it did nothing). So a
+   controller GameController files as a Switch Pro Controller is read from its HID reports from the start;
+   TOTK_GYRO_HID=0 keeps GameController's motion (the zero fallback still applies). */
 #import <IOKit/hid/IOHIDManager.h>
 static IOHIDManagerRef hidManager;   /* main queue */
 static IOHIDDeviceRef hidDevice;     /* main queue */
@@ -246,7 +250,7 @@ static void hid_report(void *ctx, IOReturn result, void *sender, IOHIDReportType
         runtime_motion_feed(acc, gyro, now - (uint64_t)(2 - k) * step);
     }
 }
-static void hid_motion_start(void) {   /* main queue */
+static void hid_motion_start(const char *why) {   /* main queue */
     if (!motionPad || hidDevice) return;
     const char *name = (motionPad.vendorName ?: @"controller").UTF8String;
     hidManager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
@@ -255,7 +259,7 @@ static void hid_motion_start(void) {   /* main queue */
     IOHIDDeviceRef d = (__bridge IOHIDDeviceRef)devices.anyObject;
     IOReturn r = d ? IOHIDDeviceOpen(d, kIOHIDOptionsTypeNone) : kIOReturnNotFound;
     if (r != kIOReturnSuccess) {
-        fprintf(stderr, "[gyro] %s: GameController's motion is all zeros and no Switch Pro HID device could be opened (0x%x): no motion from it\n", name, r);
+        fprintf(stderr, "[gyro] %s: %s, but no Switch Pro HID device could be opened (0x%x): GameController's motion kept\n", name, why, r);
         CFRelease(hidManager); hidManager = NULL; return;
     }
     hidDevice = (IOHIDDeviceRef)CFRetain(d); hidLast = 0; hidUserCalibration = NO;
@@ -263,7 +267,7 @@ static void hid_motion_start(void) {   /* main queue */
     IOHIDDeviceScheduleWithRunLoop(hidDevice, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
     IOHIDDeviceRegisterInputReportCallback(hidDevice, hidReport, sizeof hidReport, hid_report, NULL);
     runtime_motion_deadzone_default(1.2); runtime_motion_live(1);
-    fprintf(stderr, "[gyro] %s: GameController's motion is all zeros; reading the six-axis sensor from its HID reports\n", name);
+    fprintf(stderr, "[gyro] %s: %s; reading the six-axis sensor from its HID reports\n", name, why);
     /* IMU on, then the calibrations; spaced out, as the controller drops subcommands sent back to back */
     static const uint8_t imuOn[1] = {0x01}, factory[5] = {0x20, 0x60, 0, 0, 24}, user[5] = {0x26, 0x80, 0, 0, 26};
     hid_subcommand(0x40, imuOn, sizeof imuOn);
@@ -304,6 +308,8 @@ void runtime_feedback_attach(GCController *c) {   /* main queue */
         m.valueChangedHandler = ^(GCMotion *changed) { motion_sample(changed); };
         motionPad = c; runtime_motion_live(1);
         fprintf(stderr, "[gyro] %s: motion sensors on (gyro%s)\n", name, m.hasGravityAndUserAcceleration ? ", gravity" : ", acceleration");
+        const char *viaHid = getenv("TOTK_GYRO_HID");
+        if ([c.productCategory isEqualToString:@"Switch Pro Controller"] && !(viaHid && !strcmp(viaHid, "0"))) hid_motion_start("a Switch Pro Controller");
     }
 }
 void runtime_feedback_detach(GCController *c) {   /* main queue */
