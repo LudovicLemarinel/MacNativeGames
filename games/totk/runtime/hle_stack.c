@@ -101,6 +101,12 @@ void runtime_hle_trace_set(int mode) {
     }
 }
 
+/* This thread's host-stack slot: non-zero exactly while the thread runs guest code (the gate and the switch clear it
+   while they use the host stack). threads.c reads it to preempt a thread only there. */
+volatile uintptr_t *runtime_hle_slot(void) {
+    uintptr_t tp; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tp));
+    return runtime_hle_tsd_off ? (volatile uintptr_t *)(tp + runtime_hle_tsd_off) : NULL;
+}
 /* Called on a guest thread's own host stack before it enters guest code; top must leave room for the caller's frame. */
 void runtime_hle_stack_set(uintptr_t top) {
     uintptr_t tp; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tp));

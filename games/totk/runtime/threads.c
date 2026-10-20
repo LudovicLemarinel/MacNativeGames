@@ -24,6 +24,7 @@
 #include "thread_compat.h"
 #include "ipc.h"
 #include <errno.h>
+#include <stdatomic.h>
 #include <sched.h>
 #include <signal.h>
 #include <sys/mman.h>
@@ -65,6 +66,9 @@ typedef struct thr {
     uint32_t wh[4]; int nwh;   // handles of the current WaitSynchronization (state dump)
     int last_hle;              // 1 + wrapper index of the last host call made while "hletrace" was on (state dump)
     uint64_t yrun_ns, yrun_svc;   // the current run of yields: when it started, and nsvc at its last yield (yield_backoff_ns)
+    uint32_t woken_by; uint64_t woken_lr;   // TOTK_WAIT_LOG: the thread that woke this one, and where it was in guest code
+    volatile uintptr_t *slot;   // runtime_hle_slot(): non-zero while this thread runs guest code (async preemption)
+    uint32_t got_from; const char *got_why; uint64_t got_held, got_lr; int got_svc;   // TOTK_WAIT_LOG: who handed this thread its core, how, after holding it how long
 } thr_t;
 static thr_t *g_all;
 
@@ -113,7 +117,10 @@ static thr_t *pick(int kind, uint64_t a) {
     }
     return b;
 }
-static void wake(thr_t *t, int64_t res) { wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; pthread_cond_signal(&t->cv); }
+static void wake(thr_t *t, int64_t res) {
+    thr_t *by = g_keythr ? pthread_getspecific(g_keythr) : NULL; t->woken_by = by ? by->handle : 0; t->woken_lr = by ? by->last_lr : 0;
+    wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; pthread_cond_signal(&t->cv);
+}
 // 挂起直到被唤醒或超时（ns<0 无限、0 立即超时）；返回 wres 或 R_TIMEOUT
 // Suspend until woken or timed out (ns<0 infinite, 0 immediate timeout); returns wres or R_TIMEOUT
 static int64_t block_inner(thr_t *t, int kind, int64_t ns);
@@ -129,16 +136,35 @@ static thr_t *g_core_wait;
 static int g_cores_on = -1;
 static int cores_enabled(void) { if (g_cores_on < 0) g_cores_on = getenv("TOTK_FREE_CORES") ? 0 : 1; return g_cores_on; }
 static int core_allowed(const thr_t *t, int c) { return (int)((t->mask >> c) & 1); }
-static void core_grant(int c) {   // holding G: give free core c to the best waiter
+static const char *g_put_why = "?";   // TOTK_WAIT_LOG: why the next core_put gives its core up (holding G)
+static void core_grant(int c, thr_t *from) {   // holding G: give free core c to the best waiter
     thr_t *b = NULL, **bp = NULL;
     for (thr_t **p = &g_core_wait; *p; p = &(*p)->cnext)
         if (core_allowed(*p, c) && (!b || (*p)->prio < b->prio || ((*p)->prio == b->prio && (*p)->cseq < b->cseq))) { b = *p; bp = p; }
     if (!b) return;
-    *bp = b->cnext; b->cnext = NULL; b->cur_core = c; b->core_since = now_ns(); g_core_owner[c] = b; pthread_cond_signal(&b->cv);
+    *bp = b->cnext; b->cnext = NULL; b->cur_core = c; b->core_since = now_ns(); g_core_owner[c] = b;
+    b->got_from = from ? from->handle : 0; b->got_why = g_put_why; b->got_held = from ? b->core_since - from->core_since : 0; b->got_lr = from ? from->last_lr : 0; b->got_svc = from ? from->last_svc : 0;
+    pthread_cond_signal(&b->cv);
+}
+/* Threads asked to give their core up (preempt set), for the check at every host call (hle_stack.S): Horizon switches to
+   a higher-priority thread at once, but here a thread gave its core up only at its next SVC. BotW's NVN recording
+   threads (priority 44) make thousands of NVN calls and few SVCs, and its priority-32 thread waited about 27 ms for
+   their core, 721 times in 3 minutes (2026-10-20, TOTK_WAIT_LOG): the frame drops. Changed holding G. */
+_Atomic int runtime_preempt_pending;
+/* Even so a thread can run guest code for 10 ms and more without a host call (BotW's priority-44 recording threads;
+   2026-10-20), while the priority-32 thread pinned to the same core waits. Horizon preempts at once, so the holder is
+   also sent SIGURG while it runs guest code, where it holds no host lock, and gives the core up in the handler.
+   TOTK_ASYNC_PREEMPT=0 turns it off. */
+static int async_preempt(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_ASYNC_PREEMPT"); on = !e || atoi(e); } return on; }
+static void preempt_kick(thr_t *t) {   // holding G
+    if (async_preempt() && t->preempt && t->slot && *t->slot && t->pt) pthread_kill(t->pt, SIGURG);
+}
+static void preempt_set(thr_t *t, int v) {
+    if (t->preempt != v) { t->preempt = v; atomic_fetch_add_explicit(&runtime_preempt_pending, v ? 1 : -1, memory_order_relaxed); if (v) preempt_kick(t); }
 }
 static void core_put(thr_t *t) {   // holding G
     if (t->cur_core < 0) return;
-    int c = t->cur_core; t->cur_core = -1; t->preempt = 0; g_core_owner[c] = NULL; core_grant(c);
+    int c = t->cur_core; t->cur_core = -1; preempt_set(t, 0); g_core_owner[c] = NULL; core_grant(c, t); g_put_why = "?";
 }
 static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask is handed over
     if (!cores_enabled() || t->cur_core >= 0) return;
@@ -147,31 +173,83 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
     for (int i = 0; c < 0 && i < NCORE; i++) if (core_allowed(t, i) && !g_core_owner[i]) c = i;
     if (c >= 0) { t->cur_core = c; t->core_since = now_ns(); g_core_owner[c] = t; return; }
     t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t;
-    for (int i = 0; i < NCORE; i++) if (core_allowed(t, i) && g_core_owner[i] && g_core_owner[i]->prio > t->prio) g_core_owner[i]->preempt = 1;
-    while (t->cur_core < 0) pthread_cond_wait(&t->cv, &G);
+    for (int i = 0; i < NCORE; i++) if (core_allowed(t, i) && g_core_owner[i] && g_core_owner[i]->prio > t->prio) preempt_set(g_core_owner[i], 1);
+    while (t->cur_core < 0) {
+        if (!async_preempt()) { pthread_cond_wait(&t->cv, &G); continue; }
+        struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 1000000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
+        if (pthread_cond_timedwait(&t->cv, &G, &dl) == ETIMEDOUT && t->cur_core < 0)   // the holder may have gone back to guest code since
+            for (int i = 0; i < NCORE; i++) if (core_allowed(t, i) && g_core_owner[i] && g_core_owner[i]->prio > t->prio) preempt_kick(g_core_owner[i]);
+    }
 }
+static void core_take_logged(thr_t *t);   // TOTK_WAIT_LOG, below
 static thr_t *me_or_null(void) { return g_keythr ? pthread_getspecific(g_keythr) : NULL; }
 void runtime_thread_note_hle(unsigned i) { thr_t *t = me_or_null(); if (t) t->last_hle = (int)i + 1; }   // hle_stack.c, while tracing
 uint32_t runtime_thread_current_handle(void) { thr_t *t = me_or_null(); return t ? t->handle : 0; }
 // Host services that wait for other threads or the GPU give the core up around the wait (no host locks held).
 int runtime_core_away(void) {
     thr_t *t = me_or_null(); if (!t || t->cur_core < 0) return 0;
-    pthread_mutex_lock(&G); core_put(t); pthread_mutex_unlock(&G); return 1;
+    pthread_mutex_lock(&G); g_put_why = "blocking host call"; core_put(t); pthread_mutex_unlock(&G); return 1;
 }
 void runtime_core_back(int *away) {
     thr_t *t = me_or_null(); if (!*away || !t) return;
     pthread_mutex_lock(&G); core_take(t); pthread_mutex_unlock(&G);
 }
-// Preemption point at SVC entry: a higher-priority thread waits for this core.
-void runtime_core_checkpoint(void) {
+// Preemption point at SVC entry and at host calls (hle_stack.S): a higher-priority thread waits for this core.
+static void core_checkpoint(const char *why) {
     thr_t *t = me_or_null(); if (!t || !t->preempt) return;
-    pthread_mutex_lock(&G); t->preempt = 0; core_put(t); core_take(t); pthread_mutex_unlock(&G);
+    pthread_mutex_lock(&G); g_put_why = why; core_put(t); core_take_logged(t); pthread_mutex_unlock(&G);
+}
+void runtime_core_checkpoint(void) { core_checkpoint("preempted at an SVC"); }
+void runtime_core_checkpoint_hle(void) { core_checkpoint("preempted at a host call"); }
+/* SIGURG (preempt_kick): give the core up if this thread is in guest code, where it holds no host lock; elsewhere the
+   next SVC or host call does it. */
+static void preempt_signal(int sig, siginfo_t *si, void *uc) {
+    (void)sig; (void)si;
+    extern int runtime_module_offset(uint64_t pc, const char **name, uint64_t *off);
+    thr_t *t = me_or_null(); if (!t || !t->preempt || !t->slot || !*t->slot) return;
+    const char *nm; uint64_t off; if (!runtime_module_offset(((ucontext_t *)uc)->uc_mcontext->__ss.__pc, &nm, &off)) return;
+    int e = errno; core_checkpoint("preempted in guest code (signal)"); errno = e;
+}
+void runtime_preempt_init(void) {
+    if (!async_preempt()) return;
+    struct sigaction a = {0}; a.sa_sigaction = preempt_signal; a.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART; sigemptyset(&a.sa_mask);
+    sigaction(SIGURG, &a, NULL);
 }
 int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? (t->cur_core >= 0 ? t->cur_core : t->core) : -1; }
 
+/* Diagnostic TOTK_WAIT_LOG=1 (2026-10-20, BotW frame drops): the main thread's waits over 20 ms (what it waited on,
+   who woke it and from where in guest code), and any thread's wait over 5 ms for a virtual core (who held it, and
+   since when). Holding G. */
+static thr_t *g_main_thr;
+static int wait_log(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_WAIT_LOG"); on = e && atoi(e); } return on; }
+static void wait_where(char *b, size_t n, uint64_t pc) {
+    extern int runtime_module_offset(uint64_t pc, const char **name, uint64_t *off);
+    const char *nm; uint64_t off; if (pc && runtime_module_offset(pc, &nm, &off)) snprintf(b, n, "%s+%#llx", nm, (unsigned long long)off); else snprintf(b, n, "%#llx", (unsigned long long)pc);
+}
+static void core_take_logged(thr_t *t) {
+    if (!wait_log() || !cores_enabled() || t->cur_core >= 0) { core_take(t); return; }
+    thr_t *held[NCORE]; uint64_t since[NCORE];
+    for (int c = 0; c < NCORE; c++) { held[c] = g_core_owner[c]; since[c] = held[c] ? held[c]->core_since : 0; }
+    uint64_t t0 = now_ns(); core_take(t); uint64_t w = now_ns() - t0;
+    if (w < 5000000) return;
+    char line[512]; size_t o = 0;
+    for (int c = 0; c < NCORE && o < sizeof line - 120; c++) if (core_allowed(t, c) && held[c]) {
+        char wh[64]; wait_where(wh, sizeof wh, held[c]->last_lr);
+        o += snprintf(line + o, sizeof line - o, " core%d=%#x(prio %d, held %.1f ms, last svc %#x at %s)", c, held[c]->handle, held[c]->prio, (t0 - since[c]) / 1e6, held[c]->last_svc, wh);
+    }
+    char gl[64]; wait_where(gl, sizeof gl, t->got_lr);
+    LOG("[wait] %s%#x (prio %d) waited %.1f ms for a core:%s; got it from %#x (%s after %.1f ms, last svc %#x at %s)", t == g_main_thr ? "MAIN " : "", t->handle, t->prio, w / 1e6,
+        o ? line : " (all free when it began)", t->got_from, t->got_why, t->got_held / 1e6, t->got_svc, gl);
+}
 static int64_t block(thr_t *t,int kind,int64_t ns) {
     if (ns == 0) return block_inner(t, kind, ns);
-    core_put(t); int64_t r = block_inner(t, kind, ns); core_take(t); return r;
+    uint64_t t0 = wait_log() && t == g_main_thr ? now_ns() : 0;
+    g_put_why = "waiting (SVC)"; core_put(t); int64_t r = block_inner(t, kind, ns);
+    if (t0) { uint64_t w = now_ns() - t0;
+        if (w > 20000000) { char wh[64], at[64]; wait_where(wh, sizeof wh, t->woken_lr); wait_where(at, sizeof at, t->last_lr);
+            LOG("[wait] MAIN svc %#x at %s, kind %d addr %#llx key %#llx: %.1f ms, %s %#x at %s", t->last_svc, at, kind, (unsigned long long)t->waddr, (unsigned long long)t->wkey,
+                w / 1e6, r == R_TIMEOUT ? "timed out; last waker" : "woken by", t->woken_by, wh); } }
+    core_take_logged(t); return r;
 }
 static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
     t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
@@ -272,11 +350,12 @@ void dm_thread_returned(void) { die("客体线程入口函数返回（Horizon �
 // Register the main thread and return its handle (passed to nnosInitialize as the main thread handle)
 uint32_t svc_thread_main_init(void) {
     pthread_key_create(&g_keythr, NULL);
+    runtime_preempt_init();
     thr_t *t = calloc(1, sizeof *t);
     pthread_cond_init(&t->cv, NULL);
     t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt);
     t->cur_core = -1;
-    pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; core_take(t); pthread_mutex_unlock(&G);
+    pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; core_take(t); g_main_thr = t; pthread_mutex_unlock(&G);
     pthread_setspecific(g_keythr, t);
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
     pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
@@ -348,7 +427,8 @@ static uint64_t yield_backoff_ns(uint64_t run_ns) {
 }
 
 int svc_thread(int num, uint64_t *regs) {
-    { thr_t *me = (g_keythr ? pthread_getspecific(g_keythr) : NULL); if (me) { me->last_svc = num; me->last_lr = regs[30]; me->last_fp = regs[29]; me->nsvc++; } }
+    { thr_t *me = (g_keythr ? pthread_getspecific(g_keythr) : NULL); if (me) { me->last_svc = num; me->last_lr = regs[30]; me->last_fp = regs[29]; me->nsvc++;
+        if (!me->slot) { extern volatile uintptr_t *runtime_hle_slot(void); me->slot = runtime_hle_slot(); } } }
 
     switch (num) {
     case 0x08: {  // CreateThread(→w1 句柄; x1 入口, x2 参数, x3 栈顶, w4 优先级, w5 核) | CreateThread(→w1 handle; x1 entry, x2 argument, x3 stack top, w4 priority, w5 core)
@@ -380,7 +460,7 @@ int svc_thread(int num, uint64_t *regs) {
         int64_t ns = (int64_t)regs[0];
 
         thr_t *self = cur();
-        if (ns > 0) { pthread_mutex_lock(&G); core_put(self); pthread_mutex_unlock(&G); }
+        if (ns > 0) { pthread_mutex_lock(&G); g_put_why = "SleepThread"; core_put(self); pthread_mutex_unlock(&G); }
         if (ns > 0 && dm_detclock_enabled()) {
             uint64_t deadline = guest_ns() + (uint64_t)ns;
             while (guest_ns() < deadline) { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
@@ -392,11 +472,11 @@ int svc_thread(int num, uint64_t *regs) {
             if (me) me->yrun_svc = me->nsvc;
             pthread_mutex_lock(&G);   // Horizon yield: hand the core to a waiting thread of equal or higher priority
             int give = 0; for (thr_t *w = g_core_wait; w && !give; w = w->cnext) give = me->cur_core >= 0 && core_allowed(w, me->cur_core) && w->prio <= me->prio;
-            if (give) { core_put(me); core_take(me); }
+            if (give) { g_put_why = "yield"; core_put(me); core_take(me); }
             pthread_mutex_unlock(&G);
             uint64_t backoff = !give && me ? yield_backoff_ns(y0 - me->yrun_ns) : 0;
             if (backoff) {   // a long poll: sleep with the core given up, as SleepThread(ns) does
-                pthread_mutex_lock(&G); core_put(me); pthread_mutex_unlock(&G);
+                pthread_mutex_lock(&G); g_put_why = "yield back-off"; core_put(me); pthread_mutex_unlock(&G);
                 struct timespec ts = {0, (long)backoff}; nanosleep(&ts, 0);
                 pthread_mutex_lock(&G); core_take(me); pthread_mutex_unlock(&G);
             } else if (!give) sched_yield();
