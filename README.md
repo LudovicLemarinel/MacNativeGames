@@ -2,6 +2,9 @@
 
 # English
 
+**Breath of the Wild 1.6.0 is now officially supported on Mac!** (Mac only for now: no iPhone or iPad build yet.)
+**Tears of the Kingdom 1.0.0, 1.2.1 and 1.4.3 are now officially supported on Mac, iPhone and iPad!**
+
 > **Use your AI assistant to help you build the Mac app. We recommend Claude Code, Codex, or any other AI assistant you prefer.**
 
 [English](#english) | [中文](#chinese)
@@ -19,10 +22,10 @@ Play your own copy of **The Legend of Zelda: Tears of the Kingdom** natively on 
 > [!TIP]
 > **Every shader in the shared list is ready before you play.** On a Mac the game does not stop to compile it, and on an iPhone or iPad nothing is missing from the picture. The more places players cover, the smoother the game gets for everyone.
 
-The [shared shader list](docs/shader-list.md) now holds **26,832 shader variants** (23,867 shaders) from the Mac, iPhone and iPad. Every build makes them from the player's own game files, so the list holds identifiers only, never game data. Helping takes no setup:
+The [shared shader list](docs/shader-list.md) now holds **45,231 shader variants** (38,682 shaders) from the Mac, iPhone and iPad. Every build makes them from the player's own game files, so the list holds identifiers only, never game data. Helping takes no setup:
 
 1. **Play.** When your game meets a shader the list does not have yet, it notes it in `shader-list-contribution.txt`.
-2. **On a Mac, every 500 new shaders it asks you once, before the game starts.** Click "Send": the GitHub form opens and the file is shown, ready to drag in. An iPhone or iPad never asks during play: while it is connected to the Mac that built its app (cable or the same Wi-Fi), the Mac asks instead. "Don't remind me again" stops the reminders.
+2. **On a Mac, every 500 new shaders it asks you once, before the game starts.** Click "Send": the GitHub form opens and the file is shown, ready to drag in. If the GitHub CLI (`gh`) is installed and signed in, the dialog offers "Submit automatically" instead, which sends this batch for you (a private gist and an issue) without opening the browser. An iPhone or iPad never asks during play: while it is connected to the Mac that built its app (cable or the same Wi-Fi), the Mac asks instead. "Don't remind me again" stops the reminders.
 3. **Everyone's next build carries them.** Nobody stutters there again.
 
 **[Send your shaders →](https://github.com/ly05010419/MacNativeGames/issues/new?template=shader-list.yml)** · The game never uploads anything by itself.
@@ -31,6 +34,15 @@ Update history:
 
 | Date | Platform | Update |
 |---|---|---|
+| Oct 20 | All | Shader translation update: vertex outputs a shader does not write start as (0, 0, 0, 1), which brings back missing markers and effects (#91). The first launch after updating translates shaders again, because the old cache is from the previous translation (on iPhone and iPad the old cache is removed) |
+| Oct 20 | Mac | High frame rates (all four versions): trampolines bounce above 100 FPS (#61), and hair and cloth sway at the right speed above 30 FPS (#79) |
+| Oct 20 | Mac | Key 5 smooths the stair-stepped edges of the 3D scene with MetalFX temporal anti-aliasing (1.4.3); `TOTK_ANISO=16` sharpens ground and wall textures seen at a grazing angle |
+| Oct 20 | Mac | The live FPS in the menu bar; key 1 gains an FPS-only state |
+| Oct 20 | Mac | Optional UI layouts for 21:9 and 32:9 displays with the HUD in the screen's corners (1.4.3, made from your own game files) |
+| Oct 20 | Mac | Background warm-up prepares only the shaders this version of the game uses (about half the time); `TOTK_WARM_ALL=1` warms the whole cache |
+| Oct 20 | Mac | Two memory leaks fixed for both games |
+| Oct 20 | Mac | **Breath of the Wild 1.6.0** (early): a card image holding the base game, the update and the add-on content builds its own app with the same command; title, saves, the Great Plateau and the DLC packs work, keys 2 (frame interpolation) and 3 (MetalFX 2K) work |
+| Oct 20 | iPhone, iPad | The launcher adopts the UIScene lifecycle, so an IPA built with Xcode 27 starts on iOS 27 (which ends apps that still make their window in the app delegate) |
 | Oct 19 | Mac | Key 4 switches to a true 21:9 ultrawide view and back (1.2.1, 1.4.3); the HUD keeps its shape in the middle 16:9 |
 | Oct 19 | iPhone, iPad | Tested with 1.4.3: a fresh install shows the game from the first launch, without a played cache |
 | Oct 19 | iPhone, iPad | Touch controls laid out like a Switch controller, with every button and both sticks |
@@ -107,7 +119,7 @@ python3.14 build_app.py ~/Games/totk.xci -k ~/keys/prod.keys --platform ios -o ~
 
 Add `--update ~/Games/1.4.3.nsp` to select an update, and keep the `--firmware` or `--shared-fonts` option when the base game is an NSP. The first iOS build downloads and compiles device versions of Opus and libvpx and compiles the shader seed for iOS, so it needs an internet connection and substantial temporary disk space (allow at least **45 GB free** for a fresh base build, or **60 GB** for a fresh build with an update). The resulting IPA is unsigned: sign and install it with your sideloading tool, keeping its entitlements (it uses the increased memory limit). iOS/iPadOS 26 and iPhone 14 or newer are required. See [iPhone and iPad](#iphone-and-ipad) for what has been tested.
 
-Without `-o`, the selected output appears next to the game file (`Tears of the Kingdom.app` on Mac or `Tears of the Kingdom.ipa` for iOS). Before full shader preparation was added, a local clean base-1.0.0 Mac build took about 6 minutes on an M4 Mac mini (this is not a timing estimate for the current build; hardware, disk and network conditions affect the time): about a minute each to rewrite the main code module and to decrypt the 17 GB of game data, and two to three minutes for macOS to check the finished app once. The current build then also prepares the startup shaders (about 3 minutes for 1.4.3 on an M4) and compiles them for your GPU (a few more minutes; without the Metal toolchain this step is skipped, with a message, while a game is running). A Mac build needs no .NET or CMake, and the finished game needs no Python: its shader translator is a native program that comes with this repository (`games/totk/prebuilt`). Every intermediate file is in a work folder next to the game file (`TOTK_build`, or `--work`); running the script again reuses what is already done.
+Without `-o`, the selected output appears next to the game file (`Tears of the Kingdom.app` on Mac or `Tears of the Kingdom.ipa` for iOS). Before full shader preparation was added, a local clean base-1.0.0 Mac build took about 6 minutes on an M4 Mac mini (this is not a timing estimate for the current build; hardware, disk and network conditions affect the time): about a minute each to rewrite the main code module and to decrypt the 17 GB of game data, and two to three minutes for macOS to check the finished app once. The current build then also prepares the startup shaders (about 3 minutes for 1.4.3 on an M4) and compiles them for your GPU (a few more minutes on an M4, but about 25 minutes on an 8 GB M1 MacBook Air, which runs out of memory and swaps during this step; without the Metal toolchain this step is skipped, with a message, while a game is running). A Mac build needs no .NET or CMake, and the finished game needs no Python: its shader translator is a native program that comes with this repository (`games/totk/prebuilt`). Every intermediate file is in a work folder next to the game file (`TOTK_build`, or `--work`); running the script again reuses what is already done.
 
 The extracted code modules, rewritten modules, RomFS and shared fonts are checked against the selected version's `games/totk/assets/expected-v1.0.0.json`, `expected-v1.1.2.json`, `expected-v1.2.1.json` or `expected-v1.4.3.json`; the prebuilt shader translator has its own SHA-256 check. A mismatch stops the build, with one exception: a different genuine retail dump of the same version is accepted — its `main.npdm` is checked by Nintendo’s ACID signature (`npdm_signed()`) instead of the pinned hash, and its firmware’s shared fonts are checked for a valid BFTTF structure and bound by their actual SHA-256. Key values are never printed.
 
@@ -158,9 +170,21 @@ The 1.4.3 port has separately passed scene loading, movement/jumps, menus/map, s
 
 The 1.2.1 port (October 19) passed the same rewrite verification (600 of 600 negative controls) and the loader, RomFS and startup probes. On an M4 Mac it loaded saves in the 1.0.0 and 1.1.2 formats and passed movement/jumps, menus/map/quick menus, manual save and reload in a new process, fall death and retry, and the three key-3 picture modes; the packaged app was also opened through its launcher. See [the 1.2.1 test record](docs/v1.2.1-port.md); this is not full-game or long-session certification.
 
+### Breath of the Wild 1.6.0 (early)
+
+The same script builds **The Legend of Zelda: Breath of the Wild 1.6.0** (`01007EF00011E000`) from a card image that holds the base game, the 1.6.0 update and the two add-on content titles together (no `--update`; the game is recognised by the title IDs in the file, never by its name). This card has no system update partition, so the six shared fonts must come from a Tears of the Kingdom build's work folder (`TOTK_build/totk/extracted/firmware/shared-fonts`) or another verified font folder. The startup shaders come from the game data and the game's own [shared shader list](docs/shader-list.md) (`games/botw/assets/shader_list.tsv`), as for Tears of the Kingdom: every shader of the boot and title packages for its default bind state, plus every bind state the list names, compiled ahead and waited for only as far as the title screen needs.
+
+```sh
+python3.14 build_app.py ~/Games/botw.xci -k ~/keys/prod.keys --shared-fonts ~/Games/TOTK_build/totk/extracted/firmware/shared-fonts
+```
+
+The work folder is `BotW_build` next to the game file; the app is `Breath of the Wild.app` (bundle `org.macnativegames.botw`), with its own data folder `~/Library/Application Support/MacNativeGames/BotW` and log `~/Library/Logs/MacNativeGames/botw.log`. Every step is checked against `games/botw/assets/expected-v1.6.0.json`; a fresh build takes about 16 minutes on an M4 (the 15 GB RomFS merge is most of it).
+
+What works (October 20, an M4 Mac, a Great Plateau save): title, the add-on content list, loading and saving, the plateau at about 90–120 fps (the game advances by real time; held-button repeats count by real time too), the two DLC packs mounted and read, key 1 (overlays), key 2 (MetalFX frame interpolation: off → 30+30 → half the refresh rate → unlimited, every game frame interpolated on the plateau) and key 3 (MetalFX 2K on / off: MetalFX replaces the game's own upscale of the 1600x900 picture into the 1080p canvas and the window output above 1080p); a 30-minute session on the plateau at about 95 fps with memory steady (+170 MB). Not yet: native 2K, iPhone / iPad, the DLC quests themselves (only verified as mounted and read). This is an early port: expect rough edges.
+
 ### iPhone and iPad
 
-Version 1.4.3 has been played on an **iPhone 14 (iOS 26.6.1)** and an **iPad with the A16 chip (iPadOS 26.7.1)**, both signed with a personal development team in Xcode. Versions 1.0.0, 1.1.2 and 1.2.1 have not been tested on iOS.
+Version 1.4.3 has been played on an **iPhone 14 (iOS 26.6.1)** and an **iPad with the A16 chip (iPadOS 26.7.1)**, both signed with a personal development team in Xcode. Versions 1.0.0, 1.1.2 and 1.2.1 have not been tested on iOS. Breath of the Wild has no iPhone/iPad build yet: `--platform ios` with its card image stops with an error.
 
 - **First launch:** the app checks the game data (about 15 seconds) and imports the shaders it carries, with a progress bar. On an iPhone 14 this takes about 3 minutes before the title appears. Later launches show the title in about 8 seconds.
 - **Picture:** the game runs in handheld mode, as a Switch does without its dock: 1280×720.
@@ -193,7 +217,11 @@ To run without holding a button, two lines can drive the run button: `south = b 
 
 The launcher checks the file at every start and names the first bad line in an alert. Delete the file for the default layout.
 
-Mac-only extra keys: **1** show or hide all on-screen overlays (FPS, shader count, system load and the shortcut reminder, together in one small box in the window's top-right corner; `TOTK_HUD=corners` puts the readings back in the picture's corners), **2** frame interpolation (off → 30+30 → half the refresh rate → unlimited), **3** cycle picture mode (MetalFX 2K → native 2K → off), **4** ultrawide 21:9 on / off (1.2.1 and 1.4.3: the camera sees more at the sides and the picture fills a wider window; `TOTK_ASPECT=32:9` or `3440x1440` picks another shape and starts with it on; the HUD, menus and map keep their shape in the middle 16:9 of the window, the map with black bars at the sides; markers that follow objects in the world are not moved out yet). The shortcut reminder shows the current interpolation and picture modes and refreshes twice a second in both HUD layouts. MetalFX is off by default and only starts when you select its mode with **3**; resizing the window never enables it automatically. Text entry (naming a horse) uses the Mac keyboard. iPhone/iPad uses touch controls or a compatible game controller and does not show the Mac 1/2/3/4 shortcut prompts. The touch layout follows a Switch controller: L and ZL at the top left, R and ZR at the top right, − and + between them, the d-pad on the left and A, B, X, Y on the right. The d-pad sits above the left stick and A, B, X, Y above the right stick, and L3 and R3 (stick presses) are in the bottom corners. Touch the left half away from the buttons and drag for the left stick, the right half for the camera (right stick); each stick is centred where your finger goes down. With a game controller connected the touch controls are hidden: touch the screen to show and use them, and they hide again 3 seconds after you lift your fingers.
+Mac-only extra keys: **1** cycles the on-screen overlays: all of them (FPS, shader count, system load and the shortcut reminder, together in one small box in the window's top-right corner; `TOTK_HUD=corners` puts the readings back in the picture's corners), then minimal (the FPS only), then none; **2** frame interpolation (off → 30+30 → half the refresh rate → unlimited), **3** cycle picture mode (MetalFX 2K → native 2K → off), **4** ultrawide 21:9 on / off (1.2.1 and 1.4.3: the camera sees more at the sides and the picture fills a wider window; `TOTK_ASPECT=32:9` or `3440x1440` picks another shape and starts with it on; the HUD, menus and map keep their shape in the middle 16:9 of the window, the map with black bars at the sides; markers that follow objects in the world are not moved out yet), **5** edge smoothing on / off (1.4.3: MetalFX temporal anti-aliasing of the 3D scene, off at start, `TOTK_TAA=1` starts with it on; it smooths the stair-stepped edges of the scene and works together with the picture modes of **3**; `TOTK_ANISO=16` also turns on 16x anisotropic filtering for the ground, walls and foliage). The shortcut reminder shows the current interpolation and picture modes and refreshes twice a second in both HUD layouts. MetalFX is off by default and only starts when you select its mode with **3**; resizing the window never enables it automatically. Text entry (naming a horse) uses the Mac keyboard. iPhone/iPad uses touch controls or a compatible game controller and does not show the Mac 1/2/3/4/5 shortcut prompts. The touch layout follows a Switch controller: L and ZL at the top left, R and ZR at the top right, − and + between them, the d-pad on the left and A, B, X, Y on the right. The d-pad sits above the left stick and A, B, X, Y above the right stick, and L3 and R3 (stick presses) are in the bottom corners. Touch the left half away from the buttons and drag for the left stick, the right half for the camera (right stick); each stick is centred where your finger goes down. With a game controller connected the touch controls are hidden: touch the screen to show and use them, and they hide again 3 seconds after you lift your fingers.
+
+**Ultrawide layouts (optional, 1.4.3):** with key 4 the HUD and menus stay in the middle 16:9. To put the HUD in the corners of a 21:9 or 32:9 display instead, make layouts for its shape from your own game files and start with them: `.venv/bin/python scripts/make_romfs_patches.py --version v143 --aspect 3440x1440` (writes `extracted/v143/romfs-patches-3440x1440`; `--hud center` keeps the HUD in the middle) and `scripts/make_output_res_overlay.py 3440x1440 --version v143`, then `TOTK_OUTPUT_RES=3440x1440 TOTK_ASPECT=3440x1440 TOTK_UI_SQUEEZE=0 TOTK_ROMFS_PATCHES=extracted/v143/romfs-patches-3440x1440` (in the work folder). The layouts are read at start, so such a session stays wide; key 4 is not meant for it. Every edited pane is found by name and checked against the value the game ships before it is written.
+
+The menu bar shows the live frame rate as the game's own menu, on the left after the app menu ("60 FPS", or "50+50 FPS" while frame interpolation adds generated frames), whatever key 1 shows in the window; in full screen it is hidden with the menu bar. `TOTK_MENUBAR_FPS=0` leaves the menu bar alone; `TOTK_TITLE_FPS=1` also ends the window's title in the same readout ("… Ver. 1.4.3 — 60 FPS").
 
 Native 2K changes the game's composition canvas and UI to 2560×1440. The 3D scene still follows the game's separate render scaling; this does not force every internal render target to 1440p. The manual MetalFX mode also works in smaller windows and scales to the actual output size, including 4K.
 
@@ -205,7 +233,8 @@ Language: the game and the launcher's own text (startup screen, shader warm-up p
 - Shader cache: `~/Library/Application Support/MacNativeGames/TOTK/shader-cache` (delete it to translate everything again)
 - Shaders the shared list does not have yet: `~/Library/Application Support/MacNativeGames/TOTK/shader-list-contribution.txt`
 - Log: `~/Library/Logs/MacNativeGames/totk.log` (the run before: `totk.previous.log`)
-- Mods: `~/Library/Application Support/MacNativeGames/TOTK/mods/<v0|v112|v121|v143>`. Its `manifest.tsv` lists each RomFS file the mod replaces or adds as tab-separated path, size, SHA-256 and the original's SHA-256 (`-` for a file the game does not have); the files sit under the same paths. `python3 games/totk/scripts/make_mod_manifest.py <mods folder> --app <Tears of the Kingdom.app>` writes it, adding files the game lacks; a path that differs from the game's only in upper and lower case stops it (paths are case-sensitive). Only the RomFS (data) side of a mod is loaded: ExeFS parts (extra code modules, IPS patches) are not supported. The game checks every listed file at start and stops on a mismatch, or when a mod file changes while it runs. Delete the folder to play without mods.
+- Mods: `~/Library/Application Support/MacNativeGames/TOTK/mods/<v0|v112|v121|v143>`. Its `manifest.tsv` lists each RomFS file the mod replaces or adds as tab-separated path, size, SHA-256 and the original's SHA-256 (`-` for a file the game does not have); the files sit under the same paths. `python3 games/totk/scripts/make_mod_manifest.py <mods folder> --app <Tears of the Kingdom.app>` writes it, adding files the game lacks; a path that differs from the game's only in upper and lower case stops it (paths are case-sensitive). Only the RomFS (data) side of a mod is loaded: ExeFS parts (extra code modules, IPS patches) are not supported. The game checks every listed file at start and stops on a mismatch, or when a mod file changes while it runs. Delete the folder to play without mods. Step by step: [docs/mods.md](docs/mods.md).
+- Button icons: `python3.14 games/totk/scripts/make_button_icons.py <mods folder> --app <Tears of the Kingdom.app> --style keyboard` (or `--style xbox`) writes a mod that draws the Mac keyboard keys (J K I U for A B X Y, W A S D, the arrow keys and so on) or Xbox buttons (B A Y X in the Switch positions, LB/RB, LT/RT, Menu/View) in the game's button prompts. It redraws the icon font from your own RomFS (nothing of the game is in the project) and writes the manifest; files already in the folder are kept. Needs Python 3.14 and `python3.14 -m pip install fonttools`. If the folder already has a font archive (another mod's, or an earlier run) it stops; `--replace` overwrites it, which is also how to switch styles. The Xbox icons match the default face-button mapping (by position); with `TOTK_FACE_BUTTONS=label` or face buttons changed in `controls.txt` they do not. remove the font file and run `make_mod_manifest.py` to go back. Prompts drawn as fixed images (some tutorial animations) keep the Switch icons.
 
 ## Known issues
 
@@ -238,6 +267,9 @@ MIT (see [LICENSE](LICENSE)). Third-party code keeps its own license: [THIRD_PAR
 
 # 中文说明
 
+**正式支持旷野之息 1.6.0 mac了！**（目前只有 Mac 版，还不能打包 iPhone / iPad 版。）
+**正式支持王国之泪 1.0.0,1.2.1，1.4.3 Mac iPhone iPad了！**
+
 > **请使用你的 AI 助理帮你完成 Mac App 的构建。推荐 Claude Code、Codex，或其他你喜欢的 AI 助理。**
 
 [英文说明](#english) | [中文说明](#chinese)
@@ -255,10 +287,10 @@ MIT (see [LICENSE](LICENSE)). Third-party code keeps its own license: [THIRD_PAR
 > [!TIP]
 > **公共清单里的每个着色器，开玩之前就已经准备好。** Mac 上不用停下来现场编译，iPhone 和 iPad 上画面也不会缺东西。大家玩过的地方越多，所有人玩得越流畅。
 
-[公共着色器清单](docs/shader-list.md)现在有 **26,832 个着色器变体**（23,867 个着色器），来自 Mac、iPhone 和 iPad。每次打包都用玩家自己的游戏文件生成，所以清单里只有标识，不含任何游戏数据。参与不需要任何设置：
+[公共着色器清单](docs/shader-list.md)现在有 **45,231 个着色器变体**（38,682 个着色器），来自 Mac、iPhone 和 iPad。每次打包都用玩家自己的游戏文件生成，所以清单里只有标识，不含任何游戏数据。参与不需要任何设置：
 
 1. **照常玩。** 游戏遇到清单里还没有的着色器，会自动记进 `shader-list-contribution.txt`。
-2. **在 Mac 上，每攒够 500 个，它会在游戏启动前问你一次。** 点“发送”，GitHub 提交页面会打开，文件也会显示出来，拖进去就行。iPhone 和 iPad 玩的时候从不提醒：设备连着打包它的那台 Mac（线连或同一 Wi‑Fi）时，由 Mac 来问。点“不要提醒了”以后就不再问。
+2. **在 Mac 上，每攒够 500 个，它会在游戏启动前问你一次。** 点“发送”，GitHub 提交页面会打开，文件也会显示出来，拖进去就行。装了 GitHub 命令行工具（`gh`）并已登录时，对话框里会多一个“自动提交”，点了就直接替你把这一批发出去（私密 gist 加一个 issue），不用打开浏览器。iPhone 和 iPad 玩的时候从不提醒：设备连着打包它的那台 Mac（线连或同一 Wi‑Fi）时，由 Mac 来问。点“不要提醒了”以后就不再问。
 3. **下次大家打包的 App 都会带上。** 谁到那里都不会再卡顿。
 
 **[发送你的着色器 →](https://github.com/ly05010419/MacNativeGames/issues/new?template=shader-list.yml)** · 游戏不会自己上传任何东西。
@@ -267,6 +299,15 @@ MIT (see [LICENSE](LICENSE)). Third-party code keeps its own license: [THIRD_PAR
 
 | 日期 | 平台 | 更新 |
 |---|---|---|
+| 10 月 20 日 | 全部 | 着色器翻译更新：着色器没写的顶点输出从 (0, 0, 0, 1) 开始，找回了缺失的标记和特效（#91）。更新后第一次启动会重新翻译着色器，因为旧缓存是上一版翻译的（iPhone、iPad 上旧缓存会被删掉） |
+| 10 月 20 日 | Mac | 高帧率（四个版本）：100 FPS 以上蹦床能弹起来（#61），30 FPS 以上头发和衣服摆动速度正常（#79） |
+| 10 月 20 日 | Mac | 按 5 用 MetalFX 时间性抗锯齿让 3D 画面边缘的锯齿变平滑（1.4.3）；`TOTK_ANISO=16` 让斜着看的地面、墙面纹理更清楚 |
+| 10 月 20 日 | Mac | 菜单栏显示实时帧率；1 键多了“只显示 FPS”一档 |
+| 10 月 20 日 | Mac | 可选的 21:9、32:9 界面布局，HUD 贴到屏幕四角（1.4.3，用你自己的游戏文件生成） |
+| 10 月 20 日 | Mac | 后台预热只准备这个版本游戏会用到的着色器（时间约减半）；`TOTK_WARM_ALL=1` 预热整个缓存 |
+| 10 月 20 日 | Mac | 修了两处两个游戏都有的内存泄漏|
+| 10 月 20 日 | Mac | **旷野之息 1.6.0**（早期）：本体 + 更新 + 追加内容合在一起的卡带镜像用同一条命令打成单独的 App；标题、存档、初始台地和 DLC 内容包都能用，2 键（补帧）和 3 键（MetalFX 2K）都能用 |
+| 10 月 20 日 | iPhone、iPad | 启动器改用 UIScene 生命周期：用 Xcode 27 构建的 IPA 能在 iOS 27 上启动（iOS 27 会结束仍在 app delegate 里创建窗口的 App） |
 | 10 月 19 日 | Mac | 按 4 切换真正的 21:9 超宽画面（1.2.1、1.4.3），HUD 保持原比例、在中间 16:9 区域 |
 | 10 月 19 日 | iPhone、iPad | 用 1.4.3 实测：全新安装、没有玩过的缓存，第一次启动就能看到游戏画面 |
 | 10 月 19 日 | iPhone、iPad | 触屏控件按 Switch 手柄排布，所有按键和两个摇杆都有 |
@@ -343,7 +384,7 @@ python3.14 build_app.py ~/Games/totk.xci -k ~/keys/prod.keys --platform ios -o ~
 
 构建更新版时添加 `--update ~/Games/1.4.3.nsp`；本体为 NSP 时也要继续提供 `--firmware` 或 `--shared-fonts`。首次 iOS 构建会下载并编译适用于设备的 Opus 和 libvpx，并为 iOS 编译着色器种子，因此需要联网和较多临时磁盘空间（全新本体构建建议至少预留 **45 GB**，全新本体加更新包建议预留 **60 GB**）。生成的 IPA 未签名，需使用侧载工具签名和安装，签名时要保留它的权限（它用到提高内存上限）。需要 iOS / iPadOS 26，最低支持 iPhone 14。实测情况见 [iPhone 和 iPad](#iphone-和-ipad)。
 
-不使用 `-o` 时，选定的平台成品会放在游戏文件旁边（Mac 为 `Tears of the Kingdom.app`，iOS 为 `Tears of the Kingdom.ipa`）。加入完整着色器准备前，本地一次本体 1.0.0 Mac 全新构建在 M4 Mac mini 上约 6 分钟（这不是当前构建的耗时预估；耗时受硬件、磁盘和网络影响）：改写主代码模块、解密 17 GB 的游戏数据各约 1 分钟，macOS 把做好的 App 检查一遍要 2–3 分钟。现在的打包还会准备启动着色器（1.4.3 在 M4 上约 3 分钟），再为本机 GPU 编译（再要几分钟；没有 Metal 工具链时，有游戏开着会跳过这一步，并提示）。Mac 打包不需要 .NET 或 CMake，做好的游戏运行时也不需要 Python：着色器翻译器是本仓库自带的原生程序（`games/totk/prebuilt`）。所有中间文件都在游戏文件旁边的工作目录里（`TOTK_build`，或用 `--work` 指定），再运行一次会复用已经做好的部分。
+不使用 `-o` 时，选定的平台成品会放在游戏文件旁边（Mac 为 `Tears of the Kingdom.app`，iOS 为 `Tears of the Kingdom.ipa`）。加入完整着色器准备前，本地一次本体 1.0.0 Mac 全新构建在 M4 Mac mini 上约 6 分钟（这不是当前构建的耗时预估；耗时受硬件、磁盘和网络影响）：改写主代码模块、解密 17 GB 的游戏数据各约 1 分钟，macOS 把做好的 App 检查一遍要 2–3 分钟。现在的打包还会准备启动着色器（1.4.3 在 M4 上约 3 分钟），再为本机 GPU 编译（M4 上再要几分钟；8 GB 内存的 M1 MacBook Air 在这一步内存不够、要用交换空间，约 25 分钟；没有 Metal 工具链时，有游戏开着会跳过这一步，并提示）。Mac 打包不需要 .NET 或 CMake，做好的游戏运行时也不需要 Python：着色器翻译器是本仓库自带的原生程序（`games/totk/prebuilt`）。所有中间文件都在游戏文件旁边的工作目录里（`TOTK_build`，或用 `--work` 指定），再运行一次会复用已经做好的部分。
 
 提取的程序模块、改写后的模块、RomFS 和共享字体会与所选版本的 `games/totk/assets/expected-v1.0.0.json`、`expected-v1.1.2.json`、`expected-v1.2.1.json` 或 `expected-v1.4.3.json` 中的哈希核对；预编译着色器翻译器另有 SHA-256 校验。不匹配时停止构建，但有一个例外：同一版本的另一份真实零售转储会被接受——它的 `main.npdm` 改用任天堂的 ACID 签名校验（`npdm_signed()`），而不是固定的哈希；其固件的共享字体则检查是否为有效的 BFTTF 结构，并按实际 SHA-256 绑定。密钥的值不会被打印。
 
@@ -394,9 +435,21 @@ python3.14 games/totk/tools/install_desktop_entry.py --app "/路径/Tears of the
 
 1.2.1（10 月 19 日）通过了同样的改写验证（600 个反向对照全部抓到）和加载、RomFS、启动探针。在 M4 Mac 上读过 1.0.0 和 1.1.2 两种格式的存档，并通过移动 / 跳跃、菜单 / 地图 / 快捷菜单、手动存档后新进程读档、摔死重试和 3 键的三种画质；打包后的 App 也从启动器打开测试过。详见 [1.2.1 测试记录](docs/v1.2.1-port.md)；这不代表全流程或长局验收。
 
+### 旷野之息 1.6.0（早期）
+
+同一个脚本也能打包**《塞尔达传说 旷野之息》1.6.0**（`01007EF00011E000`）：卡带镜像里要同时有本体、1.6.0 更新和两个追加内容（不用 `--update`；认的是文件里的标题 ID，不看文件名）。这张卡没有系统更新分区，六个共享字体要从王国之泪打包的工作目录拿（`TOTK_build/totk/extracted/firmware/shared-fonts`），或别的已校验的字体目录。启动着色器和王国之泪一样来自游戏数据和这个游戏自己的[公共着色器清单](docs/shader-list.md)（`games/botw/assets/shader_list.tsv`）：启动包和标题包里的每个着色器按默认绑定状态翻译，清单里的每个绑定状态也翻译，打包时预先编好，第一帧只等标题要的那些。
+
+```sh
+python3.14 build_app.py ~/Games/botw.xci -k ~/keys/prod.keys --shared-fonts ~/Games/TOTK_build/totk/extracted/firmware/shared-fonts
+```
+
+工作目录是游戏文件旁边的 `BotW_build`，App 是 `Breath of the Wild.app`（`org.macnativegames.botw`），数据目录 `~/Library/Application Support/MacNativeGames/BotW`，日志 `~/Library/Logs/MacNativeGames/botw.log`。每一步对 `games/botw/assets/expected-v1.6.0.json` 核对；M4 上从头打包约 16 分钟（大头是 15 GB 的 RomFS 合并）。
+
+已验证（10 月 20 日，M4 Mac，初始台地的存档）：标题、追加内容一览、读档和存档、台地约 90–120 帧（游戏按真实时间推进，按住按键的重复也按真实时间数）、两个 DLC 内容包挂载并被读取、1 键（提示框）、2 键（MetalFX 补帧：关 → 30+30 → 刷新率一半 → 不限帧，台地上每个游戏帧都插）和 3 键（MetalFX 2K 开 / 关：MetalFX 代替游戏自己把 1600×900 的画面放大进 1080p 画布，窗口大于 1080p 时出图也放大）；台地上 30 分钟约 95 帧、内存平稳（+170 MB）。还没有：原生 2K、iPhone / iPad、DLC 的任务本身（只验证了挂载和读取）。这是早期移植，会有毛边。
+
 ### iPhone 和 iPad
 
-1.4.3 已在 **iPhone 14（iOS 26.6.1）** 和 **A16 芯片的 iPad（iPadOS 26.7.1）** 上实际游玩，两台都是在 Xcode 里用个人开发团队签名安装的。1.0.0、1.1.2 和 1.2.1 没有在 iOS 上测过。
+1.4.3 已在 **iPhone 14（iOS 26.6.1）** 和 **A16 芯片的 iPad（iPadOS 26.7.1）** 上实际游玩，两台都是在 Xcode 里用个人开发团队签名安装的。1.0.0、1.1.2 和 1.2.1 没有在 iOS 上测过。旷野之息还没有 iPhone / iPad 版：用它的卡带镜像加 `--platform ios` 会报错退出。
 
 - **第一次启动：** App 先校验游戏数据（约 15 秒），再导入随 App 准备的着色器，有进度条。iPhone 14 上约 3 分钟后出现标题画面；之后的启动约 8 秒出标题。
 - **画面：** 游戏以掌机模式运行，和 Switch 不接底座时一样：1280×720。
@@ -429,7 +482,11 @@ west = y
 
 启动器每次启动都会检查这个文件，有错时弹窗指出第一行错误。删除文件即恢复默认布局。
 
-仅限 Mac 的额外按键：**1** 同时隐藏或重新显示所有屏幕提示（FPS、着色器计数、系统负载和快捷键说明，集中在窗口右上角的一个小框里；`TOTK_HUD=corners` 恢复为画面四角显示）；**2** 补帧（关 → 30+30 → 刷新率一半 → 不限帧），**3** 循环切换画质（MetalFX 2K → 原生 2K → 关闭），**4** 21:9 超宽屏开 / 关（1.2.1 和 1.4.3：镜头两侧看到更多，画面铺满更宽的窗口；`TOTK_ASPECT=32:9` 或 `3440x1440` 换成别的比例并以宽屏启动；HUD、菜单和地图保持原比例，放在窗口中间的 16:9 区域，地图两侧是黑边；跟着世界物体走的标记还没往两侧挪）。快捷键说明会显示当前补帧和画质档位，两种提示布局都每半秒刷新一次。MetalFX 默认关闭，只有按 **3** 手动切换到该模式才会启用；放大窗口不会自动开启。文字输入（给马取名）直接用 Mac 键盘。iPhone / iPad 使用触屏控件或兼容手柄，不会显示 Mac 的 1 / 2 / 3 / 4 快捷键提示。触屏按 Switch 手柄排布：左上 L、ZL，右上 R、ZR，中间 − 和 +，左边十字键，右边 A、B、X、Y。十字键在左摇杆上方，A、B、X、Y 在右摇杆上方，L3、R3（按下摇杆）在左下角和右下角。在左半屏避开按钮的地方按住拖动是左摇杆，在右半屏是转镜头（右摇杆）；摇杆以手指按下的位置为中心。接上手柄时触屏控件自动隐藏：碰一下屏幕就会显示，可以照常使用，手指离开 3 秒后再次隐藏。
+仅限 Mac 的额外按键：**1** 循环切换屏幕提示：全部显示（FPS、着色器计数、系统负载和快捷键说明，集中在窗口右上角的一个小框里；`TOTK_HUD=corners` 恢复为画面四角显示），然后精简（只显示 FPS），然后全部隐藏；**2** 补帧（关 → 30+30 → 刷新率一半 → 不限帧），**3** 循环切换画质（MetalFX 2K → 原生 2K → 关闭），**4** 21:9 超宽屏开 / 关（1.2.1 和 1.4.3：镜头两侧看到更多，画面铺满更宽的窗口；`TOTK_ASPECT=32:9` 或 `3440x1440` 换成别的比例并以宽屏启动；HUD、菜单和地图保持原比例，放在窗口中间的 16:9 区域，地图两侧是黑边；跟着世界物体走的标记还没往两侧挪），**5** 边缘平滑开 / 关（1.4.3：对 3D 画面做 MetalFX 时间性抗锯齿，启动时关闭，`TOTK_TAA=1` 以开启状态启动；让画面中物体边缘的锯齿变平滑，可以和 **3** 的画质档位一起用；另设 `TOTK_ANISO=16` 给地面、墙面和植物开 16 倍各向异性过滤）。快捷键说明会显示当前补帧和画质档位，两种提示布局都每半秒刷新一次。MetalFX 默认关闭，只有按 **3** 手动切换到该模式才会启用；放大窗口不会自动开启。文字输入（给马取名）直接用 Mac 键盘。iPhone / iPad 使用触屏控件或兼容手柄，不会显示 Mac 的 1 / 2 / 3 / 4 / 5 快捷键提示。触屏按 Switch 手柄排布：左上 L、ZL，右上 R、ZR，中间 − 和 +，左边十字键，右边 A、B、X、Y。十字键在左摇杆上方，A、B、X、Y 在右摇杆上方，L3、R3（按下摇杆）在左下角和右下角。在左半屏避开按钮的地方按住拖动是左摇杆，在右半屏是转镜头（右摇杆）；摇杆以手指按下的位置为中心。接上手柄时触屏控件自动隐藏：碰一下屏幕就会显示，可以照常使用，手指离开 3 秒后再次隐藏。
+
+**超宽屏界面布局（可选，1.4.3）：** 用 4 键时 HUD 和菜单留在中间 16:9。想让 HUD 贴到 21:9 或 32:9 屏幕的四角，可以用你自己的游戏文件按屏幕比例生成布局再启动：`.venv/bin/python scripts/make_romfs_patches.py --version v143 --aspect 3440x1440`（写到 `extracted/v143/romfs-patches-3440x1440`；`--hud center` 让 HUD 留在中间）和 `scripts/make_output_res_overlay.py 3440x1440 --version v143`，然后用 `TOTK_OUTPUT_RES=3440x1440 TOTK_ASPECT=3440x1440 TOTK_UI_SQUEEZE=0 TOTK_ROMFS_PATCHES=extracted/v143/romfs-patches-3440x1440` 启动（在工作目录里）。布局在启动时读取，所以这一局一直是宽屏，不配合 4 键使用。每个要改的界面面板都按名字查找，写入前核对游戏原版的值。
+
+菜单栏左侧、应用菜单之后以游戏自己的菜单显示实时帧率（“60 FPS”，补帧显示生成帧时为“50+50 FPS”），与 1 键在窗口里显示什么无关；全屏时随菜单栏隐藏。`TOTK_MENUBAR_FPS=0` 不在菜单栏显示；`TOTK_TITLE_FPS=1` 时窗口标题末尾也显示同样的帧率（“… Ver. 1.4.3 — 60 FPS”）。
 
 原生 2K 将游戏合成画布和 UI 改为 2560×1440，3D 场景仍由游戏独立的渲染比例控制，并非强制所有内部通道以 1440p 渲染。手动 MetalFX 在较小窗口中也可使用，输出放大会跟随实际窗口尺寸，包括 4K。
 
@@ -441,7 +498,8 @@ west = y
 - 着色器缓存：`~/Library/Application Support/MacNativeGames/TOTK/shader-cache`（删掉会全部重新翻译）
 - 公共清单里还没有的着色器：`~/Library/Application Support/MacNativeGames/TOTK/shader-list-contribution.txt`
 - 日志：`~/Library/Logs/MacNativeGames/totk.log`（上一次运行：`totk.previous.log`）
-- 模组：`~/Library/Application Support/MacNativeGames/TOTK/mods/<v0|v112|v121|v143>`。其中的 `manifest.tsv` 以制表符分隔列出模组替换或新增的每个 RomFS 文件：路径、大小、SHA-256 和原文件的 SHA-256（游戏里没有的新文件写 `-`）；文件按相同路径存放。可用 `python3 games/totk/scripts/make_mod_manifest.py <模组文件夹> --app <Tears of the Kingdom.app>` 生成，游戏里没有的文件会作为新增文件写入；只是大小写和游戏里的路径不同的会报错（路径区分大小写）。只加载模组的 RomFS（数据）部分，ExeFS 部分（额外的代码模块、IPS 补丁）不支持。游戏启动时校验所有列出的文件，不一致即停止；游戏运行中模组文件被改动也会停止。删除该文件夹即可不带模组运行。
+- 模组：`~/Library/Application Support/MacNativeGames/TOTK/mods/<v0|v112|v121|v143>`。其中的 `manifest.tsv` 以制表符分隔列出模组替换或新增的每个 RomFS 文件：路径、大小、SHA-256 和原文件的 SHA-256（游戏里没有的新文件写 `-`）；文件按相同路径存放。可用 `python3 games/totk/scripts/make_mod_manifest.py <模组文件夹> --app <Tears of the Kingdom.app>` 生成，游戏里没有的文件会作为新增文件写入；只是大小写和游戏里的路径不同的会报错（路径区分大小写）。只加载模组的 RomFS（数据）部分，ExeFS 部分（额外的代码模块、IPS 补丁）不支持。游戏启动时校验所有列出的文件，不一致即停止；游戏运行中模组文件被改动也会停止。删除该文件夹即可不带模组运行。详细步骤见 [docs/mods.md](docs/mods.md)。
+- 按键图标：`python3.14 games/totk/scripts/make_button_icons.py <模组文件夹> --app <Tears of the Kingdom.app> --style keyboard`（或 `--style xbox`）生成一个模组，把游戏按键提示里的 Switch 图标换成 Mac 键盘按键（A B X Y 对应 J K I U、W A S D、方向键等）或 Xbox 按键（按 Switch 位置排列的 B A Y X、LB/RB、LT/RT、Menu/View）。它用你自己的 RomFS 重绘图标字体（项目里不含任何游戏内容）并写好 manifest；文件夹里已有的文件会保留。需要 Python 3.14 和 `python3.14 -m pip install fonttools`。文件夹里已有字体包（别的模组的，或者上次生成的）时会停下，加 `--replace` 才覆盖，换风格也要加它。Xbox 图标对应默认的按位置映射；设了 `TOTK_FACE_BUTTONS=label` 或在 `controls.txt` 里改过面键时会对不上。删除字体文件后运行 `make_mod_manifest.py` 即可恢复。以固定图片显示的提示（部分教程动画）仍是 Switch 图标。
 
 ## 已知问题
 

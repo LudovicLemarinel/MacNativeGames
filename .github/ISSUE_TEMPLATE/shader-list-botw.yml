@@ -1,26 +1,19 @@
-name: BOTW shader list contribution / 提交旷野之息着色器清单
-description: Breath of the Wild only. Send the shaders your game met that the BOTW shader list does not have yet. 仅限旷野之息：发送你的游戏遇到的、旷野之息着色器清单里还没有的着色器。
-title: "BOTW shader list: "
+name: Shader list contribution (Breath of the Wild) / 提交着色器清单（旷野之息）
+description: Send the shaders your Breath of the Wild met that its shared shader list does not have yet. 发送你的旷野之息遇到的、它的公共着色器清单里还没有的着色器。
+title: "Shader list (Breath of the Wild): "
 labels: ["shader-list-botw"]
 body:
   - type: markdown
     attributes:
       value: |
-        Thank you! The file holds shader keys and bind states only: no game data, saves or personal information. Once merged into [the shared list](https://github.com/ly05010419/MacNativeGames/blob/main/docs/shader-list.md), these shaders come with everyone's next build.
+        Thank you! The file holds shader keys and bind states only: no game data, saves or personal information. Once merged into [the game's shared list](https://github.com/ly05010419/MacNativeGames/blob/main/docs/shader-list.md) (`games/botw/assets/shader_list.tsv`), these shaders come with everyone's next build.
 
-        谢谢！这个文件只有着色器的标识和绑定状态，不含游戏内容、存档或个人信息。并入[公共清单](https://github.com/ly05010419/MacNativeGames/blob/main/docs/shader-list.md)后，以后大家打包的 App 都会带上这些着色器。
+        谢谢！这个文件只有着色器的标识和绑定状态，不含游戏内容、存档或个人信息。并入[这个游戏的公共清单](https://github.com/ly05010419/MacNativeGames/blob/main/docs/shader-list.md)（`games/botw/assets/shader_list.tsv`）后，以后大家打包的 App 都会带上这些着色器。
   - type: dropdown
     id: version
     attributes:
       label: Game version / 游戏版本
-      options: ["1.9.0"]
-    validations:
-      required: true
-  - type: dropdown
-    id: platform
-    attributes:
-      label: Device / 设备
-      options: ["Mac"]
+      options: ["1.6.0"]
     validations:
       required: true
   - type: textarea
@@ -28,8 +21,8 @@ body:
     attributes:
       label: shader-list-contribution.txt
       description: |
-        Drag the file here: `~/Library/Application Support/MacNativeGames/BOTW/shader-list-contribution.txt` (the reminder shows it in Finder).
-        把文件拖到这里：`~/Library/Application Support/MacNativeGames/BOTW/shader-list-contribution.txt`（提醒会在访达里显示它）。
+        Drag the file here: `~/Library/Application Support/MacNativeGames/BotW/shader-list-contribution.txt` (the reminder shows it in Finder).
+        把文件拖到这里：`~/Library/Application Support/MacNativeGames/BotW/shader-list-contribution.txt`（提醒会在访达里显示它）。
       placeholder: Drop shader-list-contribution.txt here / 把 shader-list-contribution.txt 拖到这里
     validations:
       required: true

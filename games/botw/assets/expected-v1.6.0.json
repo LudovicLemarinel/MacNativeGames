@@ -1,0 +1,57 @@
+{
+  "_comment": "BOTW 1.6.0 code bytes, verified rewrite, merged base + 1.6.0 RomFS and the DLC images (the same as the card image upstream verified them on; identical to 1.9.0's DLC images). NintendoSDK 7.3.2: sdk and subsdk0 differ from TOTK's, and the runtime has SDK 7 entry points for it (GAME_BOTW160). Built like 1.9.0 from a base game 1.0.0 and a separate update (build_app.py --game botw).",
+  "title_id": "01007EF00011E000",
+  "update_title_id": "01007EF00011E800",
+  "version": 786432,
+  "display_version": "1.6.0",
+  "sdk_version": "7.3.2",
+  "exefs_sha256": {
+    "main": "15cfca7b89348956f85d945fade2e215a6af5991ed1071e181f97ca72f7ae20b",
+    "main.npdm": "f36df1a7b3faa617ef2a3901e26970bf04800c70ea442624b347d06202f46b1e",
+    "rtld": "e893e12a4199b0c2c15775bf03f58987fa6227923ba8a04832aabf2352d2b1b7",
+    "sdk": "754cf4b581d749fbe3d457cf66497b141ef994cf592d247919d64a37dcc30d27",
+    "subsdk0": "d22d98656a19be240b554e7db8d69126d6427232521238d665aec3509087f2cf"
+  },
+  "rewritten_sha256": {
+    "main.patched.bin": "c41ac2fa9be737f2e6b0ab641508e9a51995b03463ff6aa445ce04e5e8766a8e",
+    "sdk.patched.bin": "d950b6f1af7690231fe17e6db77d26dabf9dbf565b04774c11d7fbc605f117dd",
+    "subsdk0.patched.bin": "f5bc35332258bd850f2137c7953916dad47bd5f3ce67e5d208a1b31336c6c8da"
+  },
+  "romfs": {
+    "size": 15131979952,
+    "sha256": "89d922b7b01f09766530a601f3dcfca8bdd4e94e6387f1c1335c4f3c6662b625",
+    "files": 41052
+  },
+  "base_exefs_sha256": {
+    "_comment": "Base game 1.0.0 (NintendoSDK 0.12.14, six modules, NVN in subsdk0). Required for the RomFS merge only; its code is not a port target.",
+    "main": "fa2541333fdb5a868a286ea138774d82d13a1b0b97988d7af6c60ed82d2b1c81",
+    "main.npdm": "27e604002489d5f3ef5017cebedfd2c13e3eec87825690cdd658b2b9086c557e",
+    "rtld": "2bf1918e54e3d6378f150e45a264c151558198703a778408db5ac26263a3a362",
+    "sdk": "0abff9d26d975cb17c24ddfecca488a4900e20ffd7ab9bb642e6df667dde9f31",
+    "subsdk0": "58b6791aff6e5cb509c5347c1dc41d01a32c0a298c7f5da0c88ea56fc8a6eb17",
+    "subsdk1": "a1b399f06db89bac005e8c7d8ce3475f931a9cdff6b7fc3509b9427e0a47be41",
+    "subsdk2": "e56eec1a58d1fa53779469e6eea36a795c0deac90bbf25b54b97c44ed195bd65",
+    "subsdk3": "2f344d84badf826937317e033b47f32bb2e1e8b7856553ce7356616268b5e238"
+  },
+  "aoc": {
+    "_comment": "DLC (add-on content) RomFS images, all six IVFC levels verified. Index = title ID - 01007EF00011F000. The game lists two DLC and mounts index 1 as aoc: (the Expansion Pass data); index 2 holds only System/AocVersion.txt and must be present for the game to use index 1.",
+    "01007EF00011F001": {
+      "version": 196608,
+      "size": 1390370680,
+      "sha256": "6fc0b5f075bd52ab5390e98b4c07ffccd1db5efbcfd514003ded703fcdd2d42b"
+    },
+    "01007EF00011F002": {
+      "version": 196608,
+      "size": 648,
+      "sha256": "a66389137e8505994bba3c5930e709c38d95579dae4554ab5a93ee9e519ebd20"
+    }
+  },
+  "shared_fonts_sha256": {
+    "standard": "823913c9d80807979381e327846466f561f31ba1842cea8f7fedc5ad7d45d2ad",
+    "chinese-simplified": "7e95d45f43c6f35ee0c7bd8ea446675d8ab0390e18fd2844abcac11d2bff7389",
+    "chinese-simplified-extension": "0f90d45b741e9da7700c416eb2b51996b458c3e4fb3c3291740b758c298e7a25",
+    "chinese-traditional": "9d59b74e59a2dc92296d6bebad7cce791ba94688bd436304aaae174a58bd7457",
+    "korean": "5a4e694782ead5ddcbc0a226aab24362e2d641ca33bac7bdf8cda36ff157c9e8",
+    "nintendo-extension": "f9f62e025c9bbe0e9ae25a54ba5011202b1e3a3f3c33b2d876c40aff6174af68"
+  }
+}

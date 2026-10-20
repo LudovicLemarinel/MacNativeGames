@@ -43,16 +43,21 @@ UPDATED = json.loads((GAME / 'assets/expected-v1.1.2.json').read_text())
 UPDATED121 = json.loads((GAME / 'assets/expected-v1.2.1.json').read_text())
 UPDATED143 = json.loads((GAME / 'assets/expected-v1.4.3.json').read_text())
 BOTW190 = json.loads((REPO / 'games/botw/assets/expected-v1.9.0.json').read_text())
-VERSIONS = {'v0': EXPECTED, 'v112': UPDATED, 'v121': UPDATED121, 'v143': UPDATED143, 'v190': BOTW190}
+BOTW160 = json.loads((REPO / 'games/botw/assets/expected-v1.6.0.json').read_text())
+VERSIONS = {'v0': EXPECTED, 'v112': UPDATED, 'v121': UPDATED121, 'v143': UPDATED143, 'v190': BOTW190, 'botw160': BOTW160}
+# Per version, where it differs from its game: the launcher's version macro (runtime/game_version.h), and the app's
+# bundle identifier and default name (1.6.0 keeps its own saves and log, so it is its own app beside 1.9.0)
+VERSION_APP = {'botw160': dict(define='GAME_BOTW160', bundle_id='org.macnativegames.botw160', name='Breath of the Wild 1.6.0')}
 # --game: TOTK (default) or BOTW (in preparation, docs/botw-port.md).
-# BOTW's 1.0.0 code is not a target: its base game only supplies the RomFS under 1.9.0. define: the launcher's version
-# macro prefix; seed: a startup shader seed (prepare_shader_seed.py; BOTW's RomFS is Yaz0, read through tools/yaz0.c);
+# BOTW's 1.0.0 code is not a target: its base game only supplies the RomFS under 1.9.0 or 1.6.0 (--game-version; the
+# newest the folder has by default). define: the launcher's version macro prefix (VERSION_APP: per version); seed: a
+# startup shader seed (prepare_shader_seed.py --game botw);
 # shader_list: the game's shared shader list (docs/shader-list.md): the two games share no shader.
 GAMES = {
     'totk': dict(name='Tears of the Kingdom', title_id='0100F2C0115B6000', updates=('v112', 'v121', 'v143'), work='TOTK_build',
                  base_code=True, seed=True, executable='TOTK', bundle_id='org.macnativegames.totk', define='TOTK_GAME_',
                  shader_list=REPO / 'games/totk/assets/shader_list.tsv'),
-    'botw': dict(name='Breath of the Wild', title_id='01007EF00011E000', updates=('v190',), work='BOTW_build',
+    'botw': dict(name='Breath of the Wild', title_id='01007EF00011E000', updates=('v190', 'botw160'), work='BOTW_build',
                  base_code=False, seed=True, executable='BOTW', bundle_id='org.macnativegames.botw', define='BOTW_GAME_',
                  shader_list=REPO / 'games/botw/assets/shader_list.tsv'),
 }
@@ -181,13 +186,34 @@ def npdm_signed(path):
     return _pss_sha256_valid(data[acid:acid + 0x100], NINTENDO_ACID_MODULUS, data[acid + 0x100:acid + 0x100 + size])
 
 
-def exefs_matches(exefs, expected):
-    """True when the extracted ExeFS holds the expected modules; a signed main.npdm of another dump is accepted."""
+def npdm_program_id(path):
+    """The program ID in a well-formed npdm's ACI0 block (16 upper-case hex digits), else None."""
+    data = path.read_bytes()
+    if len(data) < 0x80 or data[:4] != b'META':
+        return None
+    aci, aci_size = struct.unpack_from('<II', data, 0x70)
+    if aci_size < 0x20 or aci + aci_size > len(data) or data[aci:aci + 4] != b'ACI0':
+        return None
+    return f'{struct.unpack_from("<Q", data, aci + 0x10)[0]:016X}'
+
+
+def npdm_kind(path, title):
+    """How a main.npdm that is not the reference dump's file is accepted: 'signed' (Nintendo's ACID signature: another
+    genuine dump), 'resigned' (a well-formed npdm of this title whose ACID a dump tool signed again, as tools that change
+    an NCA's key generation do), else None. The game never reads main.npdm here, and the code modules are checked by
+    hash, so a re-signed one is accepted only alongside matching code (exefs_matches, step_code)."""
+    if npdm_signed(path):
+        return 'signed'
+    return 'resigned' if npdm_program_id(path) == title.upper() else None
+
+
+def exefs_matches(exefs, expected, title):
+    """True when the extracted ExeFS holds the expected code modules and a main.npdm of this version (npdm_kind)."""
     for name, digest in expected.items():
-        path = exefs / name
-        if not path.is_file() or (sha256(path) != digest and not (name == 'main.npdm' and npdm_signed(path))):
+        if name != 'main.npdm' and (not (exefs / name).is_file() or sha256(exefs / name) != digest):
             return False
-    return True
+    npdm = exefs / 'main.npdm'
+    return 'main.npdm' not in expected or (npdm.is_file() and (sha256(npdm) == expected['main.npdm'] or npdm_kind(npdm, title) is not None))
 
 
 def _bfttf_valid(path):
@@ -263,7 +289,7 @@ def prepare_work(work, py, logs):
     # allows rsync -a to copy a tooling symlink from a development checkout.
     excludes = [f'--exclude=/{name}' for name in ('extracted', 'rewritten', 'build', 'analysis', '.venv', 'tooling', 'user-data')]
     run(['rsync', '-a', *excludes, f'{GAME}/', f'{tree}/'], logs / 'sources.log')
-    if SELECTED is not GAMES['totk']:
+    if SELECTED['title_id'] != GAMES['totk']['title_id']:
         # The tree is TOTK's folder; another game's list takes the place of TOTK's, so the Makefile exports its warm-up
         # lists and prepare_shader_seed.py reads it, as for TOTK
         shutil.copy2(SELECTED['shader_list'], tree / 'assets/shader_list.tsv')
@@ -343,14 +369,14 @@ def identify_update(tree, game, keys, logs):
     for version in SELECTED['updates']:
         exefs = tree / f'extracted/{version}/exefs'
         if source_matches(exefs.parent / 'extraction-manifest.json', source) and exefs_matches(
-                exefs, VERSIONS[version]['exefs_sha256']):
+                exefs, VERSIONS[version]['exefs_sha256'], VERSIONS[version]['title_id']):
             return version, source
     staging = tree / 'extracted/update-detection'
     if staging.exists(): shutil.rmtree(staging)
     run([tree / '.venv/bin/python', 'scripts/extract_exefs.py', source, '--keys', keys, *title_args(),
          '--update', '--output', staging / 'exefs'], logs / 'identify-update.log', cwd=tree)
     version = next((version for version in SELECTED['updates']
-                    if exefs_matches(staging / 'exefs', VERSIONS[version]['exefs_sha256'])), None)
+                    if exefs_matches(staging / 'exefs', VERSIONS[version]['exefs_sha256'], VERSIONS[version]['title_id'])), None)
     if version is None:
         supported = ' or '.join(VERSIONS[v]['display_version'] for v in SELECTED['updates'])
         raise BuildError(f'unsupported update module hashes; expected {supported} (the file name is not used to choose a version)')
@@ -423,7 +449,7 @@ def select_packages(packages, everything, folder):
             why = 'not used: duplicate'
         say(f'   {Path(p["file"]).name}: {what}, {why}')
     if not bases:
-        others = sorted(f'{g["name"]} (--game {k})' for k, g in GAMES.items() if g is not SELECTED and any(
+        others = sorted(f'{g["name"]} (--game {k})' for k, g in GAMES.items() if g['title_id'] != SELECTED['title_id'] and any(
             m['type'] == 'base' and m['title_id'] == g['title_id'] for p in everything for m in p['metas']))
         raise BuildError(f'no verified {SELECTED["name"]} base game in {folder}' +
                          (f'; this folder has {", ".join(others)}' if others else ''))
@@ -479,7 +505,7 @@ def step_code(tree, game, keys, env, logs, *, version="v0"):
     exefs = tree / f'extracted/{version}/exefs'
     want = expected['exefs_sha256']
     manifest = exefs.parent / 'extraction-manifest.json'
-    if not source_matches(manifest, game) or not exefs_matches(exefs, want):
+    if not source_matches(manifest, game) or not exefs_matches(exefs, want, expected['title_id']):
         say('1/4 code: extracting the ExeFS from the game file')
         if exefs.exists():
             shutil.rmtree(exefs)
@@ -491,8 +517,13 @@ def step_code(tree, game, keys, env, logs, *, version="v0"):
         got = sha256(exefs / n)
         if got == h:
             continue
-        if n == 'main.npdm' and npdm_signed(exefs / n):
+        kind = npdm_kind(exefs / n, expected['title_id']) if n == 'main.npdm' else None
+        if kind == 'signed':
             say(f"1/4 code: main.npdm is a Nintendo-signed {expected['display_version']} file from another dump; using it")
+            continue
+        if kind == 'resigned':   # the code modules are checked in this same loop: any mismatch there still stops the build
+            say(f"1/4 code: main.npdm of this dump was signed again by a dump tool (not Nintendo's signature, e.g. a changed "
+                f"key generation); the game does not use it and the code must match {expected['display_version']}; using it")
             continue
         check(f'ExeFS {n}', got, h)
     if not (tree / f'extracted/{version}/elf/main-inventory.json').exists():
@@ -714,9 +745,13 @@ def step_update_data(tree, game, update, keys, logs, *, version='v112'):
         run([tree/'.venv/bin/python', 'scripts/prepare_romfs_backend.py', '--version', version],
             logs/f'{version}-romfs-backend.log', cwd=tree)
         return
-    for script, arguments in [('make_romfs_patches.py', []), ('make_output_res_overlay.py', ['2560x1440'])]:
+    steps = [('make_romfs_patches.py', []), ('make_output_res_overlay.py', ['2560x1440'])]
+    if version == 'v143':   # a TOTK_RENDER_RES scene above 1600x900 grows the same heaps (runtime/game_patches_v143.c)
+        steps += [('make_output_res_overlay.py', [canvas, '--scene', scene])
+                  for canvas in ('1920x1080', '2560x1440') for scene in ('1920x1080', '2560x1440')]
+    for i, (script, arguments) in enumerate(steps):
         run([tree/'.venv/bin/python', 'scripts/'+script, *arguments, '--version', version],
-            logs/(version+'-'+script+'.log'), cwd=tree)
+            logs/(version+'-'+script+(f'-{i}' if i > 1 else '')+'.log'), cwd=tree)
 
 
 def step_dlc(tree, dlcs, keys, logs, *, version):
@@ -797,13 +832,11 @@ def step_shaders(tree, logs, *, version='v0'):
         say(f'3/4 shaders: no startup shader seed for {SELECTED["name"]} yet; shaders are translated as they appear')
         return
     say('3/4 shaders: discovering and translating startup shaders from your game data')
-    # BOTW's packs are Yaz0, which Python does not read: a small native decoder, used only while building
-    run(['xcrun', 'clang', '-O2', '-Wall', '-Wextra', '-shared', 'tools/yaz0.c', '-o', 'build/libyaz0.dylib'],
-        logs/'yaz0-build.log', cwd=tree)
     run([tree/'.venv/bin/python', 'scripts/prepare_shader_seed.py',
          '--romfs', tree/f'extracted/{version}/romfs', '--output', tree/f'build/shader-seed/{version}',
          '--translator', translator, '--spirv-cross', tree/'build/spirv-cross/spirv-cross',
-         '--version', version, '--modules', tree/f'rewritten/{version}', '--yaz0', tree/'build/libyaz0.dylib'],
+         '--version', version, '--modules', tree/f'rewritten/{version}',
+         *([] if SELECTED['title_id'] == GAMES['totk']['title_id'] else ['--game', 'botw', '--shader-list', tree/'assets/shader_list.tsv'])],
         logs/'prepare-shader-seed.log', cwd=tree)
 
 
@@ -896,7 +929,7 @@ def step_shader_libs(tree, logs, *, version='v0'):
 def step_binary(tree, game, keys, env, logs, *, version="v0"):
     say('4/4 app: building the game binary and the launcher')
     run(['make', f'-j{os.cpu_count() or 4}', 'runtime' if version == 'v0' else f'runtime-{version}'], logs / 'runtime.log', cwd=tree, env=env)
-    run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Ithird_party/d2r_gfx/gfx/nvn', '-Iruntime', *([] if version == 'v0' else [f'-D{SELECTED["define"]}{version.upper()}=1']), 'app/launcher.m', '-framework', 'AppKit',
+    run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Ithird_party/d2r_gfx/gfx/nvn', '-Iruntime', *([] if version == 'v0' else [f'-D{VERSION_APP.get(version, {}).get("define", SELECTED["define"] + version.upper())}=1']), 'app/launcher.m', '-framework', 'AppKit',
          '-o', 'build/app-launcher'], logs / 'launcher.log', cwd=tree, env=env)
     # used only while packaging (step_warm_metal); not part of the app
     run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Wextra', 'tools/warm_metal_cache.m', '-framework', 'Metal',
@@ -962,8 +995,8 @@ def step_app(tree, out, logs, *, version="v0"):
             raise BuildError('startup shader seed was not prepared; refusing an app without first-launch warm-up data')
         try:
             report = json.loads((seed/'seed-manifest.json').read_text())
-            if (report['version'] != version or report['chain'] != 'totk-native-v4-unverified' or
-                    report['shaders'] < 8000 or not report['files'] or any(
+            if (report['version'] != version or report['chain'] != 'totk-native-v5-unverified' or
+                    report['shaders'] < (8000 if SELECTED['title_id'] == GAMES['totk']['title_id'] else 2000) or not report['files'] or any(
                         Path(name).name != name or sha256(seed/name) != digest for name, digest in report['files'].items())):
                 raise ValueError('version, translation chain or file hash differs')
         except (ValueError, KeyError, OSError, TypeError) as error:
@@ -974,7 +1007,8 @@ def step_app(tree, out, logs, *, version="v0"):
         if lib.is_file():
             clone(lib, res/'build/shader-libs'/lib.name)
     clone(tree / 'build/app-launcher', tmp / 'Contents/MacOS' / SELECTED['executable'])
-    info = dict(CFBundleDevelopmentRegion='en', CFBundleExecutable=SELECTED['executable'], CFBundleIdentifier=SELECTED['bundle_id'],
+    info = dict(CFBundleDevelopmentRegion='en', CFBundleExecutable=SELECTED['executable'],
+                CFBundleIdentifier=VERSION_APP.get(version, {}).get('bundle_id', SELECTED['bundle_id']),
                 CFBundleName=SELECTED['name'], CFBundleDisplayName=SELECTED['name'], CFBundlePackageType='APPL', CFBundleShortVersionString=expected['display_version'],
                 CFBundleVersion=str(expected['version'] + 1), LSMinimumSystemVersion='26.0', NSHighResolutionCapable=True,
                 LSApplicationCategoryType='public.app-category.action-games', LSSupportsGameMode=True,
@@ -1065,7 +1099,7 @@ def step_warm_metal(tree, out, logs):
         say(f"4/4 app: {who} has Metal's shader cache open, so the startup shaders are compiled on the first start instead "
             '(what this build compiled now would be lost when that program quits)')
         return
-    say("4/4 app: compiling the startup shaders for this Mac's GPU once (about 2 minutes on an M4; minutes saved on the first start)")
+    say("4/4 app: compiling the startup shaders for this Mac's GPU once (about 2 minutes on an M4, about 25 on an 8 GB M1; minutes saved on the first start)")
     t0 = time.time()
     try:
         clone(tree / 'build/warm-metal-cache', tool)
@@ -1110,8 +1144,10 @@ def parse_args(argv):
     ap.add_argument('--work', type=Path, help='work folder (default: TOTK_build or BOTW_build next to the game file)')
     ap.add_argument('--no-shader-reminder', action='store_true', help='iOS: do not install the Mac agent that asks, while an iPhone / iPad with the game is connected, to send the shaders the shared list lacks')
     ap.add_argument('--game', choices=sorted(GAMES), default='totk',
-                    help='totk (default) or botw: BOTW needs its base 1.0.0 and --update 1.9.0 and builds '
-                         'for macOS only; in preparation, without a startup shader seed (docs/botw-port.md)')
+                    help='totk (default) or botw: BOTW needs its base 1.0.0 and --update 1.9.0 or 1.6.0, and builds '
+                         'for macOS only (docs/botw-port.md)')
+    ap.add_argument('--game-version', help='the update version to build (e.g. 1.6.0) when the folder or --update could be '
+                    'another supported one; default: the newest supported update given')
     fonts = ap.add_mutually_exclusive_group()
     fonts.add_argument('--firmware', type=Path, help='unpacked firmware NCA directory providing the six expected shared fonts (needed for NSP unless --shared-fonts or valid cached fonts are available)')
     fonts.add_argument('--shared-fonts', type=Path, help='previously extracted shared-font directory containing the six verified .bfttf files')
@@ -1122,6 +1158,12 @@ def main(argv):
     global SELECTED
     args = parse_args(argv)
     SELECTED = GAMES[args.game]
+    if args.game_version:
+        chosen = tuple(v for v in SELECTED['updates'] if VERSIONS[v]['display_version'] == args.game_version)
+        if not chosen:
+            raise BuildError(f'--game-version {args.game_version}: {SELECTED["name"]} supports ' +
+                             ', '.join(VERSIONS[v]['display_version'] for v in SELECTED['updates']))
+        SELECTED = dict(SELECTED, updates=chosen)
     keys = args.keys.expanduser().resolve()
     if not keys.is_file():
         raise BuildError(f'no such file: {keys}')
@@ -1141,7 +1183,8 @@ def main(argv):
         place = game.parent
     if args.platform == 'ios' and args.game != 'totk':
         raise BuildError(f'{SELECTED["name"]} builds for macOS only')
-    out = (args.out.expanduser().resolve() if args.out else place / (f'{APP_NAME}.ipa' if args.platform=='ios' else f'{SELECTED["name"]}.app'))
+    app_name = VERSION_APP.get(SELECTED['updates'][0], {}).get('name', SELECTED['name']) if len(SELECTED['updates']) == 1 else SELECTED['name']
+    out = (args.out.expanduser().resolve() if args.out else place / (f'{APP_NAME}.ipa' if args.platform=='ios' else f'{app_name}.app'))
     work = (args.work.expanduser().resolve() if args.work else place / SELECTED['work'])
     if out.suffix.lower() != ('.ipa' if args.platform=='ios' else '.app'):
         raise BuildError(f'the {args.platform} output must end in {".ipa" if args.platform=="ios" else ".app"}: {out}')

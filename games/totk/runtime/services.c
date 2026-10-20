@@ -60,7 +60,7 @@ static uint8_t user_exception_context[0x1000] __attribute__((aligned(0x1000)));
 #define HEAP_CAP (4ULL<<30)   /* 1.4.3 sets a 2.2 GiB heap during nninitStartup */
 #define APP_POOL app_pool()
 static uint64_t app_pool(void){static uint64_t v;if(!v){const char *e=getenv("TOTK_APP_POOL");uint64_t extra=(runtime_output_res_extra_bytes()+0x1fffff)&~0x1fffffULL;
- v=e?strtoull(e,NULL,0):0xcd500000ULL+extra;if(!e&&extra)fprintf(stderr,"[totk] application pool %#llx: +%llu MiB for the true-2K texture heaps (TOTK_OUTPUT_RES)\n",(unsigned long long)v,(unsigned long long)(extra>>20));}return v;}
+ v=e?strtoull(e,NULL,0):0xcd500000ULL+extra;if(!e&&extra)fprintf(stderr,"[totk] application pool %#llx: +%llu MiB for the bigger texture heaps (TOTK_OUTPUT_RES, TOTK_RENDER_RES)\n",(unsigned long long)v,(unsigned long long)(extra>>20));}return v;}
 /* TOTK: application memory pool reported to the game (default: retail 3.2 GiB; TOTK_OUTPUT_RES adds what its HeapDef overlay gives the texture heaps) */
 #define ALIAS_START ((uintptr_t)alias_space)
 #define STACK_START ((uintptr_t)low_space+STACK_OFF)
@@ -314,6 +314,13 @@ void *runtime_override(const char *name) {
  void *input=runtime_input_override(name);if(input)return input;void *font=runtime_font_override(name);if(font)return font;void *codec=runtime_codec_override(name);if(codec)return codec;void *movie=runtime_movie_override(name);if(movie)return movie;void *clock=runtime_time_override(name);if(clock)return clock;void *applet=runtime_applet_override(name);if(applet)return applet;void *swkbd=runtime_swkbd_override(name);if(swkbd)return swkbd;void *account=runtime_account_override(name);if(account)return account;void *fs=runtime_fs_override(name);if(fs)return fs;void *front=runtime_front_override(name);return front?front:runtime_gfx_override(name);
 }
 void runtime_core_checkpoint(void);
+#ifdef GAME_BOTW160
+/* Breath of the Wild 1.6.0 (botw.md): the preemption point is also after every SVC. A thread the SVC woke competes for a core at
+   once (threads.c wake_queue); when it beats this one on this core, Horizon runs it before the SVC returns. */
+uint64_t runtime_svc_inner(unsigned num,uint64_t *r,const char *module,uint64_t offset);
+uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset){uint64_t v=runtime_svc_inner(num,r,module,offset);runtime_core_checkpoint();return v;}
+#define runtime_svc runtime_svc_inner
+#endif
 uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset) {
  runtime_core_checkpoint();
  // Successful SVCs occur several times per frame. Keep the detailed trace available
@@ -393,3 +400,6 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
  default:fprintf(stderr,"[totk] unimplemented SVC 0x%x at %s+%#llx\n",num,module,(unsigned long long)offset);if(num==0x1f)fprintf(stderr,"[totk] named port %.12s\n",(const char *)(uintptr_t)r[1]);runtime_trace_guest(r[29],r[30]);runtime_fail("system service not implemented");return 0;
  }
 }
+#ifdef GAME_BOTW160
+#undef runtime_svc
+#endif

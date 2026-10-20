@@ -6,13 +6,40 @@
 #define GAME_ADDR(x) GAME_ADDR_JOIN(x)
 #if defined(BOTW_GAME_V190)
 /* BOTW 1.9.0 (docs/botw-port.md): none of TOTK's main offsets apply. GAME_ADDR has no entries, so any TOTK-only
-   site that is not compiled out for GAME_BOTW stops the build. */
+   site that is not compiled out for GAME_BOTW stops the build. GAME_BOTW: both Breath of the Wild versions;
+   GAME_BOTW190 / GAME_BOTW160: one of them. */
 #define GAME_BOTW 1
+#define GAME_BOTW190 1
 #define TOTK_GAME_VERSION "1.9.0"
 #define TOTK_GAME_DIR "v190"
 #define GAME_TITLE_ID 0x01007ef00011e000ULL
 #define GAME_DISPLAY_NAME "Breath of the Wild"
 #define GAME_DISPLAY_NAME_ZH "旷野之息"
+#define GAME_NAME "Breath of the Wild"
+#define GAME_FOLDER "BOTW"   /* ~/Library/Application Support/MacNativeGames/<GAME_FOLDER> (app/launcher.m) */
+#define GAME_LOG "botw"      /* ~/Library/Logs/MacNativeGames/<GAME_LOG>.log */
+#define GAME_CONTRIB_TEMPLATE "shader-list-botw.yml"
+#define GAME_CONTRIB_TITLE "Shader list (Breath of the Wild):"
+#elif defined(GAME_BOTW160)
+/* The Legend of Zelda: Breath of the Wild 1.6.0 (botw.md). The TOTK patch sites do not exist here: game_patches_botw.c replaces
+   game_patches.c, and the shared code that uses TOTK addresses is compiled out with GAME_BOTW. Its saves and log are kept
+   apart from 1.9.0's (a 1.9.0 save is newer than this game; on a case-insensitive disk "BotW" was 1.9.0's "BOTW"). */
+#ifndef GAME_BOTW
+#define GAME_BOTW 1
+#endif
+#define TOTK_GAME_VERSION "1.6.0"
+#define GAME_TITLE_ID 0x01007ef00011e000ULL
+#define GAME_DISPLAY_NAME "Breath of the Wild"
+#define GAME_DISPLAY_NAME_ZH "旷野之息"
+#define GAME_NAME "Breath of the Wild"
+#define GAME_FOLDER "BOTW 1.6.0"   /* ~/Library/Application Support/MacNativeGames/<GAME_FOLDER> (app/launcher.m) */
+#define GAME_LOG "botw160"      /* ~/Library/Logs/MacNativeGames/<GAME_LOG>.log */
+#define GAME_CONTRIB_TEMPLATE "shader-list-botw.yml"   /* the issue form for this game's shared shader list (totk_shader_contrib.h) */
+#define GAME_CONTRIB_TITLE "Shader list (Breath of the Wild):"   /* the title prefix of an automatically submitted contribution */
+#define TOTK_GAME_DIR "botw160"
+#define GAME_ADDR_0xe995c4 0xe53f8c   /* return address of nnMain's only call to nn::oe::SetFocusHandlingMode */
+#define GAME_ADDR_0x2aa4fa0 0x2128690 /* nn::swkbd::ShowKeyboard: main's PLT stub */
+#define GAME_ADDR_0x453f648 0x2c7ef90 /* nn::swkbd::ShowKeyboard: main's GOT slot */
 #elif defined(TOTK_GAME_V143)
 #define TOTK_GAME_VERSION "1.4.3"
 #define TOTK_GAME_DIR "v143"
@@ -66,6 +93,7 @@
 #define GAME_ADDR_0x2aa4fa0 0x2b16100
 #define GAME_ADDR_0x453f648 0x46129e0
 #define GAME_ADDR_0x8f6cbc 0x8f6740
+#define GAME_ADDR_0xce3fec 0xbbb4c0   /* trampoline slow-motion check (game_patches.c patch_slowmo_bounce) */
 #define GAME_OUTPUT_CALL_WORD 0x94000083u
 #elif defined(TOTK_GAME_V121)
 /* Found from 1.1.2 by scripts/map_version_sites.py --from v112 --to v121 (every original word unchanged). */
@@ -106,6 +134,7 @@
 #define GAME_ADDR_0x2aa4fa0 0x2b18000
 #define GAME_ADDR_0x453f648 0x4615d78
 #define GAME_ADDR_0x8f6cbc 0x8f2798
+#define GAME_ADDR_0xce3fec 0xbda798
 #define GAME_OUTPUT_CALL_WORD 0x94000083u
 #else
 #define TOTK_GAME_VERSION "1.0.0"
@@ -145,6 +174,7 @@
 #define GAME_ADDR_0x2aa4fa0 0x2aa4fa0
 #define GAME_ADDR_0x453f648 0x453f648
 #define GAME_ADDR_0x8f6cbc 0x8f6cbc
+#define GAME_ADDR_0xce3fec 0xce3fec
 #define GAME_OUTPUT_CALL_WORD 0x94000082u
 #endif
 #ifndef GAME_TITLE_ID
@@ -153,4 +183,11 @@
 #ifndef GAME_DISPLAY_NAME
 #define GAME_DISPLAY_NAME "Tears of the Kingdom"
 #define GAME_DISPLAY_NAME_ZH "王国之泪"
+#endif
+#ifndef GAME_NAME
+#define GAME_NAME "Tears of the Kingdom"   /* window title and menu (game_version.h is per binary) */
+#endif
+#ifndef GAME_FOLDER
+#define GAME_FOLDER "TOTK"   /* the player's data folder under ~/Library/Application Support/MacNativeGames (app/launcher.m) */
+#define GAME_LOG "totk"
 #endif
