@@ -6,8 +6,8 @@
 
 Supported: TOTK base 1.0.0 (0100F2C0115B6000), XCI or NSP; optional --update with a supported cumulative update.
 NSPs need common tickets (unless rights-free) and a separate shared-font source. iOS builds are unsigned IPAs for sideloading and require Xcode 26+, xcodegen, CMake, and network access to build device libraries.
-In preparation: --game botw with BOTW base 1.0.0 and --update 1.9.0 (macOS only, no startup shader seed yet), and its
-DLC with --dlc (or found with --data-dir).
+In preparation: --game botw with BOTW base 1.0.0 and --update 1.9.0 (macOS only), and its DLC with --dlc (or found
+with --data-dir).
 Nothing from the game is in this repository; everything is made from your files on your Mac. Key values are never printed.
 
 Steps (each one checked against games/totk/assets/expected-v<version>.json, so a damaged dump or another version stops the
@@ -44,14 +44,17 @@ UPDATED121 = json.loads((GAME / 'assets/expected-v1.2.1.json').read_text())
 UPDATED143 = json.loads((GAME / 'assets/expected-v1.4.3.json').read_text())
 BOTW190 = json.loads((REPO / 'games/botw/assets/expected-v1.9.0.json').read_text())
 VERSIONS = {'v0': EXPECTED, 'v112': UPDATED, 'v121': UPDATED121, 'v143': UPDATED143, 'v190': BOTW190}
-# --game: TOTK (default) or BOTW (in preparation, docs/botw-port.md: no game patches, no startup shader seed yet).
+# --game: TOTK (default) or BOTW (in preparation, docs/botw-port.md).
 # BOTW's 1.0.0 code is not a target: its base game only supplies the RomFS under 1.9.0. define: the launcher's version
-# macro prefix; seed: TOTK's startup shader seed (prepare_shader_seed.py reads TOTK's own shader packages).
+# macro prefix; seed: a startup shader seed (prepare_shader_seed.py; BOTW's RomFS is Yaz0, read through tools/yaz0.c);
+# shader_list: the game's shared shader list (docs/shader-list.md): the two games share no shader.
 GAMES = {
     'totk': dict(name='Tears of the Kingdom', title_id='0100F2C0115B6000', updates=('v112', 'v121', 'v143'), work='TOTK_build',
-                 base_code=True, seed=True, executable='TOTK', bundle_id='org.macnativegames.totk', define='TOTK_GAME_'),
+                 base_code=True, seed=True, executable='TOTK', bundle_id='org.macnativegames.totk', define='TOTK_GAME_',
+                 shader_list=REPO / 'games/totk/assets/shader_list.tsv'),
     'botw': dict(name='Breath of the Wild', title_id='01007EF00011E000', updates=('v190',), work='BOTW_build',
-                 base_code=False, seed=False, executable='BOTW', bundle_id='org.macnativegames.botw', define='BOTW_GAME_'),
+                 base_code=False, seed=True, executable='BOTW', bundle_id='org.macnativegames.botw', define='BOTW_GAME_',
+                 shader_list=REPO / 'games/botw/assets/shader_list.tsv'),
 }
 SELECTED = GAMES['totk']
 HACTOOL = ('https://github.com/SciresM/hactool.git', '1d64a83450e025622f3468c28fc4164dad2c5ef6')
@@ -790,10 +793,14 @@ def step_shaders(tree, logs, *, version='v0'):
         say(f'3/4 shaders: no startup shader seed for {SELECTED["name"]} yet; shaders are translated as they appear')
         return
     say('3/4 shaders: discovering and translating startup shaders from your game data')
+    # BOTW's packs are Yaz0, which Python does not read: a small native decoder, used only while building
+    run(['xcrun', 'clang', '-O2', '-Wall', '-Wextra', '-shared', 'tools/yaz0.c', '-o', 'build/libyaz0.dylib'],
+        logs/'yaz0-build.log', cwd=tree)
     run([tree/'.venv/bin/python', 'scripts/prepare_shader_seed.py',
          '--romfs', tree/f'extracted/{version}/romfs', '--output', tree/f'build/shader-seed/{version}',
          '--translator', translator, '--spirv-cross', tree/'build/spirv-cross/spirv-cross',
-         '--version', version, '--modules', tree/f'rewritten/{version}'], logs/'prepare-shader-seed.log', cwd=tree)
+         '--version', version, '--modules', tree/f'rewritten/{version}', '--yaz0', tree/'build/libyaz0.dylib',
+         '--shader-list', SELECTED['shader_list']], logs/'prepare-shader-seed.log', cwd=tree)
 
 
 def developer_dirs():
@@ -941,10 +948,12 @@ def step_app(tree, out, logs, *, version="v0"):
                 for name in ('romfs.bin', 'runtime-index.bin'):
                     clone(tree / aoc / line.split('\t')[1] / name, res / aoc / line.split('\t')[1] / name)
     seed = tree/f'build/shader-seed/{version}'
-    if not SELECTED['seed']:
-        # TOTK's PSO list names TOTK shaders only: the app gets an empty list, and play collects its own (pso_collected.tsv)
+    if SELECTED is not GAMES['totk']:
+        # The warm-up lists the Makefile exports name TOTK shaders only: the app gets an empty list, and play collects its
+        # own (pso_collected.tsv)
         (res/'build/pso_manifest.tsv').write_text(f'# {SELECTED["name"]}: no prepared PSO list; shaders are collected while playing\n')
-    else:
+        (res/'build/pso_title.tsv').unlink(missing_ok=True)
+    if SELECTED['seed']:
         if not (seed/'seed-manifest.json').is_file():
             raise BuildError('startup shader seed was not prepared; refusing an app without first-launch warm-up data')
         try:
@@ -1036,7 +1045,7 @@ def step_warm_metal(tree, out, logs):
     while no other program has Metal's cache open (what it compiled would be lost when that program quits), and the
     result is checked in a new process. Nothing here can make the build fail: without it the game compiles the shaders
     itself, as before."""
-    if not SELECTED['seed']:   # no startup shader seed (BOTW): nothing to warm
+    if not SELECTED['seed']:   # no startup shader seed: nothing to warm
         return
     build = out / 'Contents/Resources/totk/build'
     seed = build / 'shader-seed'

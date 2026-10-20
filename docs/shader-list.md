@@ -27,7 +27,8 @@ The list holds identifiers only, never game data. Each build makes the shaders f
 | `C` | `<variant>_b`, flags | A compute pipeline the warm-up builds. |
 | `R` | pipeline key, flags | A render pipeline the warm-up builds. |
 
-- **Shader key:** the SHA-256 of the shader's NVN control section and code, computed the same way as the runtime.
+- **Shader key:** the SHA-256 of the shader's NVN control section and code, computed the same way as the runtime: 0x880
+  bytes of control, or the shorter size a control states (BOTW's, `docs/botw-port.md`).
 - **Deps:** the translator's `deps` as compact, sorted JSON. They record the texture, image, attribute and fragment
   output types the shader depends on.
 - **Flags:** `t` marks the title screen, its menu and the save list. The first frame waits only for these. `m` marks

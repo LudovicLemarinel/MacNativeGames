@@ -87,6 +87,68 @@ class ShaderInventory(unittest.TestCase):
         self.assertEqual(wrong, {})   # bytes of another game version: not used
         self.assertEqual(seed.located({(key, 'Lib/missing', 0x200, 0xb00, 0x100)}, sources.get), {})
 
+    def test_a_short_control_that_states_its_size_is_hashed_for_that_size_only(self):
+        # BOTW's BNSH controls are 0x7d1 bytes (magic, size at +0x20): what follows is not part of the key, whatever it is
+        b = bnsh()
+        for i in range(3):
+            control = 0x400+i*0x880
+            struct.pack_into('<I', b, 0x200+i*64+8+20, 0x7d1)   # the header's control size
+            struct.pack_into('<I', b, control, seed.CONTROL_MAGIC); struct.pack_into('<I', b, control+0x20, 0x7d1)
+            b[control+0x7d1:control+0x880] = bytes([0xee])*0xaf
+        rows = list(seed.bnsh_shaders(b))
+        self.assertEqual([r[1] for r in rows], ['vs', 'ps', 'cs'])
+        for key, _, control, code in rows:
+            self.assertEqual(len(control), 0x7d1)
+            self.assertEqual(key, hashlib.sha256(control+code).hexdigest())
+        # a short control that does not state its size is left out, as before: no bytes are invented
+        struct.pack_into('<I', b, 0x400+0x20, 0)
+        self.assertEqual([r[1] for r in seed.bnsh_shaders(b)], ['ps', 'cs'])
+
+    def test_key_length_follows_the_runtime(self):
+        c = bytearray(0x880)
+        self.assertEqual(seed.key_length(c), 0x880)   # agl's TOTK controls: no header
+        struct.pack_into('<I', c, 0, seed.CONTROL_MAGIC)
+        for size, want in ((0x880, 0x880), (0x88c, 0x880), (0x7d1, 0x7d1), (0x848, 0x848), (0x100, 0x880), (0x3ac3, 0x880)):
+            struct.pack_into('<I', c, 0x20, size)
+            self.assertEqual(seed.key_length(c), want, hex(size))
+        runtime = (ROOT/'games/totk/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m').read_text()
+        self.assertIn('magic == 0x98761234u && size >= 0x760 && size < 0x880 ? size : 0x880', runtime)
+        self.assertIn('CC_SHA256_Update(&ctx,control,shader_key_control_len(control))', runtime)
+
+    def test_agl_packages_with_controls_that_state_a_shorter_size(self):
+        # BOTW's agl packages: records give the control's own size (0x848) and the control states it after the magic
+        b = bytearray(0x2400)
+        b[:4] = b'BAHS'; struct.pack_into('<8I', b, 0, 0x53484142, 9, len(b), 5, 0, 0x100, 0x400, 0x2000)
+        c = bytearray(0x848); struct.pack_into('<I', c, 0, seed.CONTROL_MAGIC); struct.pack_into('<I', c, 0x20, 0x848)
+        struct.pack_into('<II', c, 0x700, 0x40, 0x100); struct.pack_into('<I', c, 0x714, 1)
+        struct.pack_into('<QIi', b, 0x100, 0x000, 0x848, 0x60); b[0x160:0x160+0x848] = c
+        b[0x160+0x848:0x160+0x880] = bytes([0xee])*0x38
+        b[0x2000:0x2100] = bytes([7])*0x100
+        got = {k: stage for k, stage, _, _ in seed.sharcb_shaders(bytes(b))}
+        self.assertEqual(got, {hashlib.sha256(bytes(c)+bytes([7])*0x100).hexdigest(): 'ps'})
+
+    @unittest.skipUnless(shutil.which('xcrun'), 'the Yaz0 decoder is built with clang')
+    def test_yaz0_packs_are_read_through_the_native_decoder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp); lib = tmp/'libyaz0.dylib'
+            subprocess.run(['xcrun', 'clang', '-O2', '-shared', ROOT/'games/totk/tools/yaz0.c', '-o', lib], check=True)
+            plain = b'abcabcabcabcX'
+            # 3 literals, then a back-reference of 9 bytes at distance 3 (0x7000 | 2: length 9 = 7 + 2), then 'X'
+            stream = bytes([0b11101000]) + b'abc' + bytes([0x70, 0x02]) + b'X'
+            packed = b'Yaz0' + struct.pack('>I', len(plain)) + bytes(8) + stream
+            romfs = tmp/'romfs'; romfs.mkdir()
+            (romfs/'romfs.bin').write_bytes(packed + packed[:-3])
+            (romfs/'index.json').write_text(json.dumps(dict(status='pass', files=[
+                dict(path='Pack/a.pack', offset=0, size=len(packed)),
+                dict(path='Pack/b.pack', offset=len(packed), size=len(packed)-3)])))
+            _, read, decode = seed.romfs_reader(romfs, lib)
+            self.assertEqual(decode(read('Pack/a.pack')), plain)
+            with self.assertRaises(ValueError):   # a damaged stream
+                decode(read('Pack/b.pack'))
+            _, read, decode = seed.romfs_reader(romfs)
+            with self.assertRaises(ValueError):   # no decoder: stop, never guess
+                decode(read('Pack/a.pack'))
+
     def test_truncated_and_out_of_range_container_is_rejected(self):
         for data in [bnsh()[:-1], bnsh()]:
             if len(data) == 0x3000:

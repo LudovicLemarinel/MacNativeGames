@@ -5073,6 +5073,15 @@ static uint64_t stage_sig(int st);
    restores copy earlier states), so they are 0 and stage_sig compares only the slots below it (it compared all 128). */
 static int g_tex_hi[6] = {1, 1, 1, 1, 1, 1};
 static NSArray *rt_local(const uint8_t *control, int st);
+/* How much of a control section the shader key hashes. TOTK's are 0x880 bytes (some 0x88c, of which 0x880 are hashed, as
+   before); agl's carry no header and are hashed for 0x880 too. BOTW's (BNSH 2.1.2) are 0x7d1, their size at +0x20 after
+   the magic: what follows in memory is another control or the game's heap, so hashing 0x880 bytes gave one shader as many
+   keys as places it was loaded from (387 for one code, 8,750 keys for 1,803 codes; 2026-10-20), each translated, compiled
+   and given its own pipelines. The fields read here end at 0x754. scripts/prepare_shader_seed.py (control_key) agrees. */
+static uint32_t shader_key_control_len(const uint8_t *control) {
+    uint32_t magic, size; memcpy(&magic, control, 4); memcpy(&size, control + 0x20, 4);
+    return magic == 0x98761234u && size >= 0x760 && size < 0x880 ? size : 0x880;
+}
 static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提交线程调用 | Called only on the submit thread
     prog_t *p = (prog_t *)cp;
     static const prog_t *lp; static uint64_t lser, lgen; static NvProg *lpr;   // 上次结果：同一对象、同一序号且序号表未变即直接用 | Last result: same object, same serial and unchanged serial table means it is used directly
@@ -5088,7 +5097,7 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提�
         memcpy(&length,control+0x704,4);memcpy(&nvn_stage,control+0x714,4);
         if (!length || length>16*1024*1024) MDIE("invalid TOTK shader code length %u",length);
         // Host NVN GPU addresses are CPU addresses (MemoryPoolGetBufferAddress).
-        uint8_t md[32];CC_SHA256_CTX ctx;CC_SHA256_Init(&ctx);CC_SHA256_Update(&ctx,control,0x880);
+        uint8_t md[32];CC_SHA256_CTX ctx;CC_SHA256_Init(&ctx);CC_SHA256_Update(&ctx,control,shader_key_control_len(control));
         CC_SHA256_Update(&ctx,(const void *)(uintptr_t)p->sd[i].data,length);CC_SHA256_Final(md,&ctx);
         char key[65];for(unsigned j=0;j<32;j++)snprintf(key+2*j,3,"%02x",md[j]);
         // TOTK: stage from control+0x714 (0 vertex, 1 fragment, 5 compute); translation answered from the bound state.

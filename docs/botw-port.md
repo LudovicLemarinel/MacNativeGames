@@ -53,7 +53,7 @@ base merged cleanly. To check a dump quickly, hash each NCA in the NSP: the firs
 The work folder defaults to `BOTW_build` next to the base game. The base game's ExeFS is checked against its known
 hashes but not rewritten; base + 1.9.0 are merged through BKTR (the pinned hactool path used for TOTK updates), all six
 IVFC levels are verified and the image must match the recorded SHA-256; the runtime RomFS index is then prepared. The
-TOTK RomFS overlays, shader seed, game binary and app steps are skipped.
+TOTK RomFS overlays are skipped; the startup shader seed is BOTW's own (see "Shader key and startup seed" below).
 
 ## Inputs examined
 
@@ -106,7 +106,8 @@ probe, and anything at runtime.
   gates like the SDK's; `loader.c` dispatches gates per module, but this has not been exercised.
 - Movies are VP9 `.webm` (`Movie/*.webm`, 30 files), like TOTK, so `movie_host.c` should apply.
 - Assets are Yaz0/SARC packs (`.sbactorpack`, `.sbfres`, `.sstera`, `.bfstm`…), not TOTK's zstd dictionaries.
-  `prepare_shader_seed.py` and the RomFS overlays cannot be reused as they are.
+  `prepare_shader_seed.py` reads them through a small native decoder (`games/totk/tools/yaz0.c`); the RomFS overlays
+  cannot be reused as they are.
 
 ## Reproduce
 
@@ -154,6 +155,33 @@ First boot (2026-10-19, M5, test profile under `MacNativeGames/BOTW/tests`): the
 intro and its title menu, with audio, at about 2,700 draws per frame. Not yet checked: controller input on the title
 menu, loading a game, gameplay.
 
+## Shader key and startup seed (2026-10-20)
+
+**The key.** The runtime names a shader by SHA-256 of its NVN control section and its code. It hashed 0x880 bytes of
+control, TOTK's size. BOTW's BNSH files (version 2.1.2) carry 0x7d1-byte controls, and its agl packages 0x848-byte
+ones; each states its size at +0x20 after the magic `0x98761234`. The 0xaf bytes after a BNSH control are the next
+control in the file, or whatever the game's heap holds where it loaded it, so one shader got a new key for every place
+it was loaded from: a played cache held **8,750 keys for 1,803 distinct codes, 387 for one code**, whose RomFS has only
+3 distinct controls. Each key was translated, compiled and given its own pipelines, and no list made ahead of play could
+name them. The key now hashes the size the control states when it is 0x760–0x87f bytes (`shader_key_control_len`,
+`nvn_mtl.m`; `key_length`, `prepare_shader_seed.py`), else 0x880 as before. TOTK's keys do not change: all 28,667 BNSH
+controls of 1.4.3 state 0x880 and agl's 102 have no header; only the two shaders of `Lib/NintendoSDK/TextureShader.bnsh`
+(0x7d1) get new keys, and the seed now carries them. **A BOTW shader cache made before this change is to be deleted**
+(`~/Library/Application Support/MacNativeGames/BOTW/shader-cache`): its keys are never met again, but the warm-up would
+still compile all of them at every start.
+
+**Where the shaders are.** In `Pack/Bootup_Graphics.pack` (`Shader/uking_*.product.sbfsha`, agl's `.sharcb` in the
+GSys and KSys archives), `Pack/Bootup.pack`, `Pack/TitleBG.pack`, effects (`Effect/*.sesetlist`) and events
+(`Event/*.sesetlist`), and 37 in the game module. The boot, graphics and title packs and the module are the startup
+packages (translated for the default bind state); effects and events are found for the shared list. BOTW's game data
+archives (`GameData/*.ssarc`) name their members `/…` and are skipped. Every code of the played cache above is found.
+
+**Measured** (M5, 2026-10-20): 19,672 shaders found in 29 s, 9,916 startup shaders, 9,861 translated in 22 s (8
+services), 55 not (53 translator failures, 2 SPIRV-Cross null pointers, as for TOTK's 84), 320 MB. `build_app.py --game
+botw` now prepares the seed, compiles it into the app when the Metal toolchain is present and warms Metal's cache, as for
+TOTK; the warm-up lists the Makefile exports name TOTK shaders, so the BOTW app gets an empty `pso_manifest.tsv` and no
+`pso_title.tsv`.
+
 ## Next steps
 
 1. **App packaging** for `--game botw`: build `runtime-v190` and the launcher with `-DBOTW_GAME_V190`, copy the
@@ -161,5 +189,5 @@ menu, loading a game, gameplay.
 2. **BOTW-specific patches**, to be found again in BOTW's main: frame pacing and the 30 FPS cap, output resolution,
    the software keyboard entry (horse naming). The zeldaret/botw decompilation (Switch 1.5.0) can help locate functions,
    but its addresses do not apply to 1.9.0.
-3. **Shaders and data.** Startup shader seeding from BOTW's `.sbfres` / shader archives; any heap or RomFS overlays the
-   higher output resolution needs.
+3. **Shaders and data.** BOTW's own shared shader list (variants and pipelines met in play, title rows); any heap or
+   RomFS overlays the higher output resolution needs.

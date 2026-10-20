@@ -22,31 +22,22 @@ from shader_list import ShaderList   # noqa: E402
 STAGES = {'vs': 0, 'ps': 1, 'cs': 5}
 
 
-def packages(romfs):
+def packages(romfs, yaz0=None):
     """Every agl shader package (.sharcb, magic BAHS) in the RomFS as (source path, decompressed bytes)."""
-    import compression.zstd as zstd
-    index = json.loads((romfs/'index.json').read_text())
-    with (romfs/'romfs.bin').open('rb') as stream:
-        def raw(row):
-            stream.seek(row['offset']); return stream.read(row['size'])
-        rows = {r['path']: r for r in index['files']}
-        dictionaries = {}
-        for data in seed.sarc(zstd.decompress(raw(rows['Pack/ZsDic.pack.zs']))).values():
-            d = zstd.ZstdDict(data); dictionaries[d.dict_id] = d
-        def decode(data):
-            if data[:4] != seed.ZSTD:
-                return data
-            info = zstd.get_frame_info(data)
-            return zstd.decompress(data, zstd_dict=dictionaries[info.dictionary_id] if info.dictionary_id else None)
-        def visit(source, data, depth):
-            if data[:4] == b'BAHS':
-                yield source, data
-            elif data[:4] == b'SARC' and depth < 4:
-                for member, child in seed.sarc(data).items():
-                    yield from visit(source+'/'+member, decode(child), depth+1)
-        for name, row in sorted(rows.items()):
-            if name.endswith('.zs') or name.endswith('.sharcb'):
-                yield from visit(name, decode(raw(row)), 0)
+    rows, raw, decode = seed.romfs_reader(romfs, yaz0)
+    def visit(source, data, depth):
+        if data[:4] == b'BAHS':
+            yield source, data
+        elif data[:4] == b'SARC' and depth < 4:
+            try:
+                members = seed.sarc(data)
+            except seed.UnsafeName:   # BOTW's game data archives
+                return
+            for member, child in members.items():
+                yield from visit(source+'/'+member, decode(child), depth+1)
+    for name in sorted(rows):
+        if name.endswith(('.zs', '.sharcb', '.pack')):   # TOTK's zstd files; BOTW keeps agl's packages in its packs
+            yield from visit(name, decode(raw(name)), 0)
 
 
 def locate(blobs, targets):
@@ -64,7 +55,8 @@ def locate(blobs, targets):
                 while start >= 0 and (q := data.find(pattern, q)) >= 0:
                     control = q - 0x704
                     if (control >= 0 and struct.unpack_from('<I', data, control+0x714)[0] == STAGES[stage] and
-                            hashlib.sha256(data[control:control+0x880]+data[start:start+length]).hexdigest() == key):
+                            hashlib.sha256(data[control:control+seed.key_length(data[control:control+0x24])] +
+                                           data[start:start+length]).hexdigest() == key):
                         found[key] = (source, control, start, length)
                         break
                     q += 1
@@ -77,10 +69,11 @@ def main(argv):
     p.add_argument('--romfs', type=Path, required=True)
     p.add_argument('--modules', type=Path, help='rewritten/<version>: the game module images')
     p.add_argument('--list', type=Path, default=seed.LIST)
+    p.add_argument('--yaz0', type=Path, help='build/libyaz0.dylib, for a RomFS packed with Yaz0 (BOTW)')
     p.add_argument('caches', type=Path, nargs='+', help='translation cache folders (their <variant>.code files)')
     a = p.parse_args(argv)
     shared = ShaderList.load(a.list)
-    _, bnsh, _, _ = seed.inventory(a.romfs.resolve(), a.modules)
+    _, bnsh, _, _ = seed.inventory(a.romfs.resolve(), a.modules, a.yaz0)
     wanted = {key for key, _ in shared.variants} - set(bnsh) - {where[0] for where in shared.locators}
     targets = {}
     for folder in a.caches:
@@ -92,7 +85,7 @@ def main(argv):
                 if stage in STAGES:
                     targets[key] = (stage, code.read_bytes())
     print(f'{len(wanted)} listed shaders are no BNSH file of this game; {len(targets)} of them have their code in a cache')
-    blobs = list(packages(a.romfs.resolve()))
+    blobs = list(packages(a.romfs.resolve(), a.yaz0))
     for module in sorted(a.modules.glob('*.patched.bin')) if a.modules else []:
         blobs.append(('module:'+module.name[:-len('.patched.bin')], module.read_bytes()))
     found = locate(blobs, targets)
