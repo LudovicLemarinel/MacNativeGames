@@ -179,8 +179,15 @@ archives (`GameData/*.ssarc`) name their members `/…` and are skipped. Every c
 **Measured** (M5, 2026-10-20): 19,672 shaders found in 29 s, 9,916 startup shaders, 9,861 translated in 22 s (8
 services), 55 not (53 translator failures, 2 SPIRV-Cross null pointers, as for TOTK's 84), 320 MB. `build_app.py --game
 botw` now prepares the seed, compiles it into the app when the Metal toolchain is present and warms Metal's cache, as for
-TOTK; the warm-up lists the Makefile exports name TOTK shaders, so the BOTW app gets an empty `pso_manifest.tsv` and no
-`pso_title.tsv`.
+TOTK.
+
+**BOTW's shader list.** `games/botw/assets/shader_list.tsv`, same format as TOTK's (`docs/shader-list.md`): the work
+folder's `assets/shader_list.tsv` is replaced by it, so the seed, the Makefile's warm-up lists (`pso_manifest.tsv`,
+`pso_title.tsv`) and the tools read BOTW's. Its first 1,419 rows (1,415 shaders) come from the played cache above: a
+played variant is kept only when its code has a single control in the RomFS, so its stable key is certain; the 2,817
+variants whose code has several controls are left for play to collect again. It has no pipeline or title rows yet.
+Players' contributions go to their own issue form (`shader-list-botw.yml`, label `shader-list-botw`;
+`collect_shader_issues.py --game botw`).
 
 ## Next steps
 
@@ -189,5 +196,5 @@ TOTK; the warm-up lists the Makefile exports name TOTK shaders, so the BOTW app 
 2. **BOTW-specific patches**, to be found again in BOTW's main: frame pacing and the 30 FPS cap, output resolution,
    the software keyboard entry (horse naming). The zeldaret/botw decompilation (Switch 1.5.0) can help locate functions,
    but its addresses do not apply to 1.9.0.
-3. **Shaders and data.** BOTW's own shared shader list (variants and pipelines met in play, title rows); any heap or
-   RomFS overlays the higher output resolution needs.
+3. **Shaders and data.** Grow BOTW's shader list from play with the stable key (variants, pipelines, title rows recorded
+   with `DM_PSO_MANIFEST=off`); any heap or RomFS overlays the higher output resolution needs.

@@ -31,6 +31,14 @@ class ContributionFileTests(unittest.TestCase):
             shared.add_rows(contrib, 'm')
             self.assertEqual(len(shared.variants), 1600)
             self.assertFalse(shared.warm)
+            self.assertIn('issues/new?template=shader-list.yml\n', contrib.read_text())   # TOTK's form unless named
+            # BOTW's launcher names its own form (TOTK_SHADER_CONTRIB_ISSUE): the runtime is the same for both games
+            botw = tmp / 'botw-contribution.txt'; url = 'https://example.com/issues/new?template=shader-list-botw.yml'
+            run = subprocess.run([str(probe), str(botw)], capture_output=True, text=True,
+                                 env={'TOTK_SHADER_CONTRIB_ISSUE': url, 'PATH': '/usr/bin:/bin'})
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertIn(f'# Send it in a GitHub issue: {url}\n', botw.read_text())
+            self.assertEqual(botw.read_text().count('# Send it'), 1)
 
 
 if __name__ == '__main__':

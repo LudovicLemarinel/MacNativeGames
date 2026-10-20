@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """The shared shader list (games/totk/assets/shader_list.tsv): the one list for the Mac, iPhone and iPad, kept by everyone.
+BOTW has its own (games/botw/assets/shader_list.tsv, same format): the two games share no shader.
 
 It holds no game data, only identifiers; the build turns them into shaders from the player's own game files.
   V <shader key> <deps>         a shader (SHA-256 of its NVN control section and code, as the runtime computes it) and the
@@ -87,7 +88,10 @@ class ShaderList:
         path = Path(path)
         if not path.exists():
             return lst
-        for number, line in enumerate(path.read_text().splitlines(), 1):
+        text = path.read_text()
+        head = ''.join(line + '\n' for line in text.splitlines()[:2] if line.startswith('# '))
+        lst.header = head if head.count('\n') == 2 else HEADER   # a list keeps its own (BOTW's names its game)
+        for number, line in enumerate(text.splitlines(), 1):
             if not line or line.startswith('#'):
                 continue
             fields = line.split('\t')
@@ -115,7 +119,7 @@ class ShaderList:
         lines = [f'V\t{key}\t{deps}' for key, deps in sorted(self.variants)]
         lines += [f'L\t{k}\t{src}\t{c:x}\t{d:x}\t{n:x}' for k, src, c, d, n in sorted(self.locators)]
         lines += ['\t'.join(row + (flags,)) for row, flags in self.warm.items()]
-        Path(path).write_text(HEADER + ''.join(line + '\n' for line in lines))
+        Path(path).write_text(getattr(self, 'header', HEADER) + ''.join(line + '\n' for line in lines))
 
     def add_warm(self, row, flag):
         old = self.warm.get(row, '')

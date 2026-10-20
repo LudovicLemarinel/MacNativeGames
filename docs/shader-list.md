@@ -4,6 +4,10 @@
 play. The Mac, iPhone and iPad builds all use it, and every player's discoveries go into it. Please send new entries
 in a pull request.
 
+Breath of the Wild has its own list, `games/botw/assets/shader_list.tsv`, in the same format: the two games share no
+shader. Its contributions go to the [BOTW shader list contribution](https://github.com/ly05010419/MacNativeGames/issues/new?template=shader-list-botw.yml)
+form; maintainers merge them with `collect_shader_issues.py --game botw`, and `shader_list.py` works on either file.
+
 ## Why it exists
 
 The game builds a shader *variant* from each shader for the bind state of a draw: which kind of texture sits in each

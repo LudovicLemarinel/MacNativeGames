@@ -14,6 +14,13 @@
 
 #define TOTK_CONTRIB_STEP 500
 #define TOTK_CONTRIB_ISSUE_URL "https://github.com/ly05010419/MacNativeGames/issues/new?template=shader-list.yml"
+#define BOTW_CONTRIB_ISSUE_URL "https://github.com/ly05010419/MacNativeGames/issues/new?template=shader-list-botw.yml"
+/* The issue form for this game's list: the runtime is built once for both games, so the launcher names it
+   (TOTK_SHADER_CONTRIB_ISSUE, app/launcher.m); TOTK's otherwise. */
+static inline const char *totk_contrib_issue_url(void) {
+    const char *e = getenv("TOTK_SHADER_CONTRIB_ISSUE");
+    return e && *e ? e : TOTK_CONTRIB_ISSUE_URL;
+}
 
 static inline NSString *totk_contrib_path(void) {
     const char *e = getenv("TOTK_SHADER_CONTRIB");
@@ -92,9 +99,9 @@ static inline void totk_contrib_add(NSString *shader, NSDictionary *deps) {
     if (!f) return;
     fseek(f, 0, SEEK_END);
     if (ftell(f) == 0)
-        fputs("# Shaders this game met that the shared shader list does not have yet (docs/shader-list.md).\n"
-              "# Only shader keys and bind states: no game data, saves or personal information.\n"
-              "# Send it in a GitHub issue: " TOTK_CONTRIB_ISSUE_URL "\n", f);
+        fprintf(f, "# Shaders this game met that the shared shader list does not have yet (docs/shader-list.md).\n"
+                   "# Only shader keys and bind states: no game data, saves or personal information.\n"
+                   "# Send it in a GitHub issue: %s\n", totk_contrib_issue_url());
     fprintf(f, "V\t%s\n", row.UTF8String);
     fclose(f);
     [rows addObject:row];

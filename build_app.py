@@ -263,6 +263,10 @@ def prepare_work(work, py, logs):
     # allows rsync -a to copy a tooling symlink from a development checkout.
     excludes = [f'--exclude=/{name}' for name in ('extracted', 'rewritten', 'build', 'analysis', '.venv', 'tooling', 'user-data')]
     run(['rsync', '-a', *excludes, f'{GAME}/', f'{tree}/'], logs / 'sources.log')
+    if SELECTED is not GAMES['totk']:
+        # The tree is TOTK's folder; another game's list takes the place of TOTK's, so the Makefile exports its warm-up
+        # lists and prepare_shader_seed.py reads it, as for TOTK
+        shutil.copy2(SELECTED['shader_list'], tree / 'assets/shader_list.tsv')
     tooling = tree / 'tooling'
     # Migrate a work folder made by the old copier before writing child links:
     # link(tooling/spirv-cross, ...) must not traverse into a shared checkout.
@@ -799,8 +803,8 @@ def step_shaders(tree, logs, *, version='v0'):
     run([tree/'.venv/bin/python', 'scripts/prepare_shader_seed.py',
          '--romfs', tree/f'extracted/{version}/romfs', '--output', tree/f'build/shader-seed/{version}',
          '--translator', translator, '--spirv-cross', tree/'build/spirv-cross/spirv-cross',
-         '--version', version, '--modules', tree/f'rewritten/{version}', '--yaz0', tree/'build/libyaz0.dylib',
-         '--shader-list', SELECTED['shader_list']], logs/'prepare-shader-seed.log', cwd=tree)
+         '--version', version, '--modules', tree/f'rewritten/{version}', '--yaz0', tree/'build/libyaz0.dylib'],
+        logs/'prepare-shader-seed.log', cwd=tree)
 
 
 def developer_dirs():
@@ -948,12 +952,12 @@ def step_app(tree, out, logs, *, version="v0"):
                 for name in ('romfs.bin', 'runtime-index.bin'):
                     clone(tree / aoc / line.split('\t')[1] / name, res / aoc / line.split('\t')[1] / name)
     seed = tree/f'build/shader-seed/{version}'
-    if SELECTED is not GAMES['totk']:
-        # The warm-up lists the Makefile exports name TOTK shaders only: the app gets an empty list, and play collects its
-        # own (pso_collected.tsv)
+    if not SELECTED['seed']:
+        # The PSO lists name this game's shaders, which the app does not carry: it gets an empty list, and play collects
+        # its own (pso_collected.tsv)
         (res/'build/pso_manifest.tsv').write_text(f'# {SELECTED["name"]}: no prepared PSO list; shaders are collected while playing\n')
         (res/'build/pso_title.tsv').unlink(missing_ok=True)
-    if SELECTED['seed']:
+    else:
         if not (seed/'seed-manifest.json').is_file():
             raise BuildError('startup shader seed was not prepared; refusing an app without first-launch warm-up data')
         try:

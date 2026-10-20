@@ -89,7 +89,7 @@ static void contrib_reminder(NSString *path) {
     NSModalResponse choice = [alert runModal];
     if (choice == NSAlertThirdButtonReturn) totk_contrib_never(path);
     if (choice != NSAlertFirstButtonReturn) return;
-    [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:@TOTK_CONTRIB_ISSUE_URL]];
+    [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:@(totk_contrib_issue_url())]];
     [NSWorkspace.sharedWorkspace activateFileViewerSelectingURLs:@[[NSURL fileURLWithPath:path]]];
 }
 
@@ -184,6 +184,9 @@ int main(int argc, char **argv) {
         setenv("TOTK_SLOT_PURPOSE", "player", 0);
         NSString *contrib = env_or("TOTK_SHADER_CONTRIB", [data stringByAppendingPathComponent:@"shader-list-contribution.txt"]);
         setenv("TOTK_SHADER_CONTRIB", contrib.fileSystemRepresentation, 1);
+#ifdef GAME_BOTW
+        setenv("TOTK_SHADER_CONTRIB_ISSUE", BOTW_CONTRIB_ISSUE_URL, 1);   // BOTW's list is its own (docs/shader-list.md)
+#endif
         contrib_reminder(contrib);
         unsetenv("TOTK_AUTOLOAD");   // the game starts at its title screen, as on the console
         /* runtime command channel (runtime/input.c): echo "shot ~/Desktop/shot.png" >> "<data>/input.txt" */
