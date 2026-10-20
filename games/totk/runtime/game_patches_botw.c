@@ -31,9 +31,15 @@ void runtime_frame_step_pin(double ms) {
     fprintf(stderr, "[totk] BOTW frame step %s (pin %.3f ms)\n", us ? "pinned" : "real time", us / 1000.0);
 }
 int runtime_frame_step_realtime(void) { return frame_ratio != NULL; }
-/* At most 60 game frames a second (hle_nvn.c, divided by the game's interval): the real-time step covers the world, but
-   the title and in-game menus advance per frame and ran far too fast above 60 on a 120 Hz display. TOTK_FRAME_CAP=0: none. */
-int runtime_frame_max_hz(void) { static int hz = -1; if (hz < 0) { const char *e = getenv("TOTK_FRAME_CAP"); hz = e && !strcmp(e, "0") ? 0 : 60; } return hz; }
+/* At most 60 game frames a second (hle_nvn.c, divided by the game's interval) until a game is loaded: the real-time step
+   covers the world, but the title advances per frame and ran far too fast above 60 on a 120 Hz display. Once the
+   player's game_data.sav is read (runtime_world_loading, fs_host.c) there is no cap (user, 2026-10-20: the render must
+   go past 60). TOTK_FRAME_CAP=<n>: that cap all the time, 0: none. */
+int runtime_world_loading(void);
+int runtime_frame_max_hz(void) {
+    static int hz = -2; if (hz == -2) { const char *e = getenv("TOTK_FRAME_CAP"); hz = e && *e ? atoi(e) : -1; if (hz < -1) hz = -1; }
+    return hz >= 0 ? hz : runtime_world_loading() > 0 ? 0 : 60;
+}
 void runtime_frame_step_update(uint64_t now_ns) {
     if (!frame_ratio || !now_ns) return;
     if (atomic_load_explicit(&pinned_step_us, memory_order_relaxed)) { last_present_ns = now_ns; return; }
