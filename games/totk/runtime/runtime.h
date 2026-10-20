@@ -102,10 +102,12 @@ void *runtime_front_override(const char *name);
 int runtime_front_focus(void);
 void runtime_shortcut_help_toggle(void);
 int fps_overlay_toggle_hints(void);   /* shared key 1 toggle for FPS, shader and system-load overlays */
+int fps_overlay_hints_enabled(void);   /* the overlays are shown (key 1) */
 int runtime_aspect_toggle(void);   /* runtime/aspect_patch.h: key 4, 16:9 <-> ultrawide (Mac: TOTK 1.2.1 / 1.4.3, BOTW 1.9.0); 0 where unavailable */
 float runtime_aspect_now(void);     /* the ratio in force, 0 = the game's own 16:9 */
 int hud_compact(void);   /* gfx/nvn/fps_overlay.c: the overlay lines go to the window's corner panel (TOTK_HUD=corners: in the picture) */
 int hud_snapshot(int line, char *out, size_t n, int *highlight);   /* line 0..2: FPS, shaders, load; 0 = not published */
+int fps_overlay_history(double *dt, int max, double window_s);   /* gfx/nvn/fps_overlay.c: the last game frames' intervals (s), oldest first */
 
 void *runtime_account_override(const char *name);
 
