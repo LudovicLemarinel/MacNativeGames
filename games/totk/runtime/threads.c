@@ -66,6 +66,7 @@ typedef struct thr {
     uint32_t wh[4]; int nwh;   // handles of the current WaitSynchronization (state dump)
     int last_hle;              // 1 + wrapper index of the last host call made while "hletrace" was on (state dump)
     uint64_t yrun_ns, yrun_svc;   // the current run of yields: when it started, and nsvc at its last yield (yield_backoff_ns)
+    uint64_t tid, woken_tid;   // TOTK_WAIT_LOG: host thread ids (pthread_threadid_np), as sample(1) names threads
     uint32_t woken_by; uint64_t woken_lr;   // TOTK_WAIT_LOG: the thread that woke this one, and where it was in guest code
     volatile uintptr_t *slot;   // runtime_hle_slot(): non-zero while this thread runs guest code (async preemption)
     uint32_t got_from; const char *got_why; uint64_t got_held, got_lr; int got_svc;   // TOTK_WAIT_LOG: who handed this thread its core, how, after holding it how long
@@ -118,7 +119,7 @@ static thr_t *pick(int kind, uint64_t a) {
     return b;
 }
 static void wake(thr_t *t, int64_t res) {
-    thr_t *by = g_keythr ? pthread_getspecific(g_keythr) : NULL; t->woken_by = by ? by->handle : 0; t->woken_lr = by ? by->last_lr : 0;
+    thr_t *by = g_keythr ? pthread_getspecific(g_keythr) : NULL; t->woken_by = by ? by->handle : 0; t->woken_lr = by ? by->last_lr : 0; t->woken_tid = by ? by->tid : 0;
     wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; pthread_cond_signal(&t->cv);
 }
 // 挂起直到被唤醒或超时（ns<0 无限、0 立即超时）；返回 wres 或 R_TIMEOUT
@@ -247,8 +248,8 @@ static int64_t block(thr_t *t,int kind,int64_t ns) {
     g_put_why = "waiting (SVC)"; core_put(t); int64_t r = block_inner(t, kind, ns);
     if (t0) { uint64_t w = now_ns() - t0;
         if (w > 20000000) { char wh[64], at[64]; wait_where(wh, sizeof wh, t->woken_lr); wait_where(at, sizeof at, t->last_lr);
-            LOG("[wait] MAIN svc %#x at %s, kind %d addr %#llx key %#llx: %.1f ms, %s %#x at %s", t->last_svc, at, kind, (unsigned long long)t->waddr, (unsigned long long)t->wkey,
-                w / 1e6, r == R_TIMEOUT ? "timed out; last waker" : "woken by", t->woken_by, wh); } }
+            LOG("[wait] MAIN svc %#x at %s, kind %d addr %#llx key %#llx: %.1f ms, %s %#x (tid %llu) at %s", t->last_svc, at, kind, (unsigned long long)t->waddr, (unsigned long long)t->wkey,
+                w / 1e6, r == R_TIMEOUT ? "timed out; last waker" : "woken by", t->woken_by, (unsigned long long)t->woken_tid, wh); } }
     core_take_logged(t); return r;
 }
 static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
@@ -309,7 +310,8 @@ void guest_thread_init(void);   // thread.c：每线程 TSD 槽（门、x18、TL
 __attribute__((weak)) void runtime_hle_stack_set(uintptr_t top) { (void)top; }   // standalone thread probe: no host-stack switch
 static void *thread_main(void *p) {
     thr_t *t = p;
-    pthread_setspecific(g_keythr, t);
+    pthread_setspecific(g_keythr, t); pthread_threadid_np(NULL, &t->tid);
+    { char nm[24]; snprintf(nm, sizeof nm, "guest-%#x", t->handle); pthread_setname_np(nm); }   // sample(1) and crash reports name the guest thread
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
     pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
@@ -353,7 +355,7 @@ uint32_t svc_thread_main_init(void) {
     runtime_preempt_init();
     thr_t *t = calloc(1, sizeof *t);
     pthread_cond_init(&t->cv, NULL);
-    t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt);
+    t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self(); pthread_threadid_np(NULL, &t->tid); t->mport = pthread_mach_thread_np(t->pt);
     t->cur_core = -1;
     pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; core_take(t); g_main_thr = t; pthread_mutex_unlock(&G);
     pthread_setspecific(g_keythr, t);
