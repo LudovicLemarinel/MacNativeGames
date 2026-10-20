@@ -2544,8 +2544,13 @@ void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
     wb_write_list(list, nl, 0);
 }
 /* Writes the listed renderings back to memory (the entries are freed); force: even over CPU writes since the render. */
-static void wb_write_list(wb_ent **list, int nl, int force) {
-    if (!nl) return;
+static void wb_write_list_body(wb_ent **list, int nl, int force);
+/* TOTK (2026-10-20, BotW): its own autorelease pool. nvnMemoryPoolInvalidateMappedRange calls this on a game thread,
+   outside the submission's pool, and game threads never drain their implicit one: every write-back's command buffer
+   and staging buffer stayed alive (about 1,700 IOAccelerator regions a minute in the world) until the GPU budget
+   stopped the game after 20-40 minutes. */
+static void wb_write_list(wb_ent **list, int nl, int force) { if (nl) @autoreleasepool { wb_write_list_body(list, nl, force); } }
+static void wb_write_list_body(wb_ent **list, int nl, int force) {
     { extern void nvn_x_drain(void) __attribute__((weak)); if (nvn_x_drain) nvn_x_drain(); }   // translation thread: nothing queued overtakes this read-back (as for ReadTexels)
     WB_WAIT_GPU(list, nl)
     /* Freshness is decided for every entry before anything is written back (a write-back marks its pages written), and
