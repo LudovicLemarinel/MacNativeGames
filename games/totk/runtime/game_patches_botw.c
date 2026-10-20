@@ -31,14 +31,29 @@ void runtime_frame_step_pin(double ms) {
     fprintf(stderr, "[totk] BOTW frame step %s (pin %.3f ms)\n", us ? "pinned" : "real time", us / 1000.0);
 }
 int runtime_frame_step_realtime(void) { return frame_ratio != NULL; }
-/* At most 60 game frames a second (hle_nvn.c, divided by the game's interval) until a game is loaded: the real-time step
-   covers the world, but the title advances per frame and ran far too fast above 60 on a 120 Hz display. Once the
-   player's game_data.sav is read (runtime_world_loading, fs_host.c) there is no cap (user, 2026-10-20: the render must
-   go past 60). TOTK_FRAME_CAP=<n>: that cap all the time, 0: none. */
+/* At most 60 game frames a second (hle_nvn.c, divided by the game's interval) outside the world: the real-time step
+   covers the world, but the title and the menus advance per frame and ran far too fast above 60 on a 120 Hz display.
+   The world is uncapped (user, 2026-10-20: the render must go past 60) once the player's game_data.sav is read
+   (runtime_world_loading, fs_host.c) and while frames draw the world's scene: the menus (inventory, map, pause) show a
+   still picture of it and draw no scene, loading screens neither. A frame counts as the world from SCENE_DRAWS scene
+   draws; three frames in a row switch the cap either way (no flicker on a single odd frame). TOTK_FRAME_CAP=<n>: that
+   cap all the time, 0: none. */
+#define SCENE_DRAWS 200
+void dm_nvn_frame_draws(uint64_t *all, uint64_t *scene);
 int runtime_world_loading(void);
 int runtime_frame_max_hz(void) {
     static int hz = -2; if (hz == -2) { const char *e = getenv("TOTK_FRAME_CAP"); hz = e && *e ? atoi(e) : -1; if (hz < -1) hz = -1; }
-    return hz >= 0 ? hz : runtime_world_loading() > 0 ? 0 : 60;
+    if (hz >= 0) return hz;
+    if (runtime_world_loading() <= 0) return 60;
+    static int world, run; uint64_t all, scene; dm_nvn_frame_draws(&all, &scene);
+    int now = scene >= SCENE_DRAWS;
+    if (now == world) run = 0;
+    else if (++run >= 3) {
+        world = now; run = 0;
+        fprintf(stderr, "[totk] BOTW %s: %s (frame draws %llu, scene %llu)\n", world ? "world" : "menu or loading", world ? "frames uncapped" : "at most 60 frames a second",
+                (unsigned long long)all, (unsigned long long)scene);
+    }
+    return world ? 0 : 60;
 }
 void runtime_frame_step_update(uint64_t now_ns) {
     if (!frame_ratio || !now_ns) return;
