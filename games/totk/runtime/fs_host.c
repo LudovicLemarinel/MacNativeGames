@@ -192,6 +192,20 @@ static File *file_of(uint64_t h, int *fd, int *mode) {
     return v > 0 ? f : NULL;
 }
 void runtime_fs_log(const char *what, const char *path);
+#ifdef GAME_BOTW
+/* BOTW's title reads only caption.sav, caption.jpg and option.sav; a slot's game_data.sav is read when a game is loaded
+   (2026-10-19: at 10.4 s, after which a frame went from about 7,000 NVN calls to 49,000). The graphics' first-world gate
+   (hle_nvn.c) waits for it: BOTW's title scene draws more than the 2,000 a frame that mark TOTK's first world frame, so
+   the gate held the title up to 15 s and left the rest of the warm-up 2 threads. A new game reads no save: no gate. */
+static _Atomic int game_loading;
+int runtime_world_loading(void) { return atomic_load(&game_loading); }
+static void note_save_opened(const char *path, int mode) {
+    const char *base = strrchr(path, '/');
+    if (!(mode & OPEN_WRITE) && base && !strcmp(base, "/game_data.sav")) atomic_store(&game_loading, 1);
+}
+#else
+static void note_save_opened(const char *path, int mode) { (void)path; (void)mode; }
+#endif
 static unsigned open_file(uint64_t *out, const char *path, int mode) {
     if (path && !runtime_romfs_owns(path)) runtime_fs_log(mode & 2 ? "write" : "read", path);
     if (runtime_romfs_owns(path)) return runtime_romfs_open(out, path, mode);
@@ -202,6 +216,7 @@ static unsigned open_file(uint64_t *out, const char *path, int mode) {
     int fd = open(p, (mode & OPEN_WRITE ? (mode & OPEN_READ ? O_RDWR : O_WRONLY) : O_RDONLY) | O_NOFOLLOW);
     if (fd < 0) return errno_result();
     runtime_autoload_save_file_opened(path);   /* TOTK_AUTOLOAD: a slot's caption.sav starts the presses, its progress.sav ends them */
+    if (kind == M_SAVE) note_save_opened(path, mode);
     pthread_mutex_lock(&lock);
     for (int i = 0; i < NFILES; i++) if (files[i].fd <= 0) {
         files[i] = (File){fd, mode, save_writer}; *out = FILE_BASE + (uint64_t)i; pthread_mutex_unlock(&lock);

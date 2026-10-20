@@ -181,6 +181,19 @@ services), 55 not (53 translator failures, 2 SPIRV-Cross null pointers, as for T
 botw` now prepares the seed, compiles it into the app when the Metal toolchain is present and warms Metal's cache, as for
 TOTK.
 
+Without Apple's offline Metal toolchain the app carries no compiled libraries and packaging warms Metal's cache instead
+(`step_warm_metal`): a 1-in-40 sample of the seed (246 shaders) compiled through Metal with the game's options
+(`warm_metal_cache.m`, safe math) in 3.3 s, none failed (M5, 2026-10-20).
+
+**Entering the world.** The warm-up waits for itself at the first world frame (at most 15 s behind the loading screen),
+then goes on with at most 2 threads. TOTK's first world frame is the first above 2,000 draws; BOTW's title scene already
+draws about 2,700, so the gate held the title instead and slowed the rest of the warm-up (now 9,861 seed shaders) to 2
+threads. BOTW's title reads only `caption.sav`, `caption.jpg` and `option.sav`; a slot's `game_data.sav` is read when a
+game is loaded (10.4 s into a logged session, just before a frame went from about 7,000 NVN calls to 49,000).
+`fs_host.c` reports that read (`runtime_world_loading`) and the gate counts draws only after it. A new game reads no
+save, so the gate never closes there: the warm-up goes on with all its threads. Not yet watched in a session: the log
+line `首次进局等管线预热` should now come after "Continue", not at the title.
+
 **BOTW's shader list.** `games/botw/assets/shader_list.tsv`, same format as TOTK's (`docs/shader-list.md`): the work
 folder's `assets/shader_list.tsv` is replaced by it, so the seed, the Makefile's warm-up lists (`pso_manifest.tsv`,
 `pso_title.tsv`) and the tools read BOTW's. Its first 1,419 rows (1,415 shaders) come from the played cache above: a

@@ -2503,6 +2503,9 @@ void nvn_present_config(int hz, int display_mode) { g_hz = g_paced_hz = hz; g_di
    uncapped or display-rate pacing would run it fast. The weak default (-1) keeps TOTK_REALTIME in charge. */
 __attribute__((weak)) int runtime_frame_step_realtime(void) { return -1; }
 __attribute__((weak)) int runtime_frame_max_hz(void) { return 0; }   /* the game's own cap on game frames a second, 0 = none */
+/* Whether a game is being loaded: 1 yes, 0 not yet, -1 the game does not say (TOTK). The first-world gate in
+   nvnQueuePresentTexture counts draws only once it is not 0. */
+__attribute__((weak)) int runtime_world_loading(void) { return -1; }
 static void present_cfg(const win_t *o) {
     if (g_hz >= 0) return;
     // 有窗口仍缺省 display 间隔模式；无窗口缺省 game 模式。环境变量可覆盖固定 60 Hz。
@@ -2629,11 +2632,14 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     // mistakenly stall the title rather than the save-loading screen.
     // Hold that first frame behind the loading screen if cache warm-up is still
     // active. This does not claim that an undiscovered variant cannot appear.
+    // BOTW's title scene draws about 2,700 a frame, so it says when a game is
+    // being loaded (runtime_world_loading, fs_host.c) and the count counts only
+    // from then on; TOTK gives no such signal (-1).
     { static int gate; static uint64_t last_draws;
       uint64_t passes, draws; mtl_stats(&passes, &draws);
       uint64_t this_draws = draws >= last_draws ? draws - last_draws : 0;
       last_draws = draws;
-      if (!gate && ((g_nvn_loadscreen_up && g_nvn_loadscreen_up()) || this_draws > 2000)) {
+      if (!gate && ((g_nvn_loadscreen_up && g_nvn_loadscreen_up()) || (this_draws > 2000 && runtime_world_loading() != 0))) {
           gate = 1; extern void mtl_note_world(void); mtl_note_world(); int ms = mtl_warm_wait(15000);
           if (ms) LOG("[nvn] 首次进局等管线预热 %d ms（本帧绘制 %llu）", ms, (unsigned long long)this_draws);
       } }
