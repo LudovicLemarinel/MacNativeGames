@@ -37,6 +37,18 @@ static unsigned vsyncCount;
 void hle_bind_system_event(void *,int);
 void hle_signal_system_event(void *);
 void *front_metal_layer(void){return (__bridge void *)metalLayer;}
+/* The display the window is on (its CGDirectDisplayID; 0 before the window exists): the pacing follows its refresh rate
+   (gfx/nvn mtl_display_hz), not the main display's. A BOTW window moved to a 75 Hz monitor while the 120 Hz built-in
+   screen stayed the main display was paced in 120 Hz ticks: 60 FPS became 75 / 37 FPS, 30+30 four 75 Hz refreshes a
+   frame (19 FPS; 2026-10-20). The display link follows it too (it drives the guest's vsync events). Main thread. */
+static _Atomic uint32_t windowDisplay;
+uint32_t front_display_id(void){return atomic_load(&windowDisplay);}
+static void note_window_screen(void){
+ NSNumber *n=window.screen.deviceDescription[@"NSScreenNumber"];uint32_t d=n?n.unsignedIntValue:CGMainDisplayID();
+ if(atomic_exchange(&windowDisplay,d)==d)return;
+ if(displayLink)CVDisplayLinkSetCurrentCGDisplay(displayLink,d);
+ CGDisplayModeRef m=CGDisplayCopyDisplayMode(d);fprintf(stderr,"[totk] window on display %u (%.0f Hz%s)\n",d,m?CGDisplayModeGetRefreshRate(m):0,d==CGMainDisplayID()?", the main display":"");if(m)CGDisplayModeRelease(m);
+}
 void front_frame_presented(void){
  if(atomic_fetch_add_explicit(&presentedFrames,1,memory_order_relaxed)==0){
   fprintf(stderr,"[totk-boot] %.3f first presented frame\n",(runtime_now_ns()-bootStartNS)/1e9);
@@ -309,6 +321,7 @@ static void note_occlusion(const char *when){int v=(window.occlusionState&NSWind
  fprintf(stderr,"[totk] window %s%s (frame %llu)\n",v?"visible":"covered (or on another Space): no presents until it is visible again",when,(unsigned long long)dm_nvn_frame_count());}
 -(void)windowDidChangeOcclusionState:(NSNotification *)n{(void)n;note_occlusion("");}
 -(void)windowDidChangeBackingProperties:(NSNotification *)n{(void)n;front_sync_drawable();}
+-(void)windowDidChangeScreen:(NSNotification *)n{(void)n;note_window_screen();}
 @end
 static TOTKWindowDelegate *windowDelegate;
 int runtime_front_window_visible(void){return atomic_load(&windowVisible);}
@@ -368,6 +381,7 @@ void runtime_front_run(void(*callback)(void)){
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW,3*NSEC_PER_SEC),dispatch_get_main_queue(),^{note_occlusion(" 3 s after opening");});
   atomic_store(&focused,1);
   if(CVDisplayLinkCreateWithActiveCGDisplays(&displayLink)||CVDisplayLinkSetOutputCallback(displayLink,vsync_callback,NULL)||CVDisplayLinkStart(displayLink))runtime_fail("native display link initialization");
+  note_window_screen();
   pthread_t guest;pthread_attr_t attr;pthread_attr_init(&attr);pthread_attr_setstacksize(&attr,8*1024*1024);int err=pthread_create(&guest,&attr,guest_main,(void *)callback);pthread_attr_destroy(&attr);if(err)runtime_fail("native game thread creation");
   [NSApp run];runtime_fail("native event loop returned unexpectedly");
  }
