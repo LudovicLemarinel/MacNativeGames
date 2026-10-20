@@ -177,8 +177,41 @@ static void front_mouse_update(void){   /* main thread; also runtime/gamepad.m's
  }
  fprintf(stderr,"[totk] mouse %s\n",want?"held by the window (key 7, or Command-Tab, lets it go)":"let go");
 }
+/* The corner panel's FPS graph (user, 2026-10-20): the game's frames of the last FPS_GRAPH_S seconds as their
+   instantaneous FPS, guides at 30 and 60, and a line with the average, the slowest and fastest frame, the 1% low (the
+   FPS of the slowest 1% of frames) and the worst frame time. Redrawn ten times a second. */
+#define FPS_GRAPH_S 5.0
+#define FPS_GRAPH_H 74
+@interface TOTKFpsGraph:NSView
+@end
+@implementation TOTKFpsGraph
+static int cmp_double(const void *a,const void *b){double x=*(const double *)a,y=*(const double *)b;return x<y?-1:x>y;}
+-(BOOL)isFlipped{return NO;}
+-(void)drawRect:(NSRect)r{(void)r;
+ static double dt[2048],sorted[2048];int n=fps_overlay_history(dt,2048,FPS_GRAPH_S);
+ NSRect b=self.bounds;CGFloat top=14,gh=b.size.height-top-2,gw=b.size.width;
+ NSDictionary *at=@{NSFontAttributeName:[NSFont monospacedSystemFontOfSize:9.5 weight:NSFontWeightMedium],NSForegroundColorAttributeName:[NSColor colorWithCalibratedWhite:0.85 alpha:1]};
+ if(n<2){[@(TOTK_UI("帧率图：等待画面…","FPS graph: waiting for frames…")) drawAtPoint:NSMakePoint(0,b.size.height-top+1) withAttributes:at];return;}
+ double sum=0,lo=1e9,hi=0;for(int i=0;i<n;i++){sum+=dt[i];if(dt[i]<lo)lo=dt[i];if(dt[i]>hi)hi=dt[i];sorted[i]=dt[i];}
+ qsort(sorted,(size_t)n,sizeof *sorted,cmp_double);
+ double p99=sorted[(int)floor((n-1)*0.99)],avg=n/sum;
+ double ymax=MAX(60.0,ceil(1.0/lo/30)*30);if(ymax>240)ymax=240;
+ /* guides */
+ for(int g=30;g<=ymax;g+=30){CGFloat y=2+gh*g/ymax;[[NSColor colorWithCalibratedWhite:1 alpha:g==60?0.28:0.14] setFill];NSRectFill(NSMakeRect(0,y,gw,1));
+  [[NSString stringWithFormat:@"%d",g] drawAtPoint:NSMakePoint(gw-14,y-1) withAttributes:@{NSFontAttributeName:[NSFont monospacedSystemFontOfSize:7.5 weight:NSFontWeightRegular],NSForegroundColorAttributeName:[NSColor colorWithCalibratedWhite:0.6 alpha:1]}];}
+ /* the curve: x is time (the newest frame at the right edge), y the frame's instantaneous FPS */
+ NSBezierPath *p=[NSBezierPath bezierPath];double t=0,span=MAX(sum,FPS_GRAPH_S*0.5);
+ for(int i=n-1;i>=0;i--){double f=MIN(1.0/dt[i],ymax);CGFloat x=gw-18-(gw-18)*t/span,y=2+gh*f/ymax;if(i==n-1)[p moveToPoint:NSMakePoint(x,y)];else [p lineToPoint:NSMakePoint(x,y)];t+=dt[i];
+  x=gw-18-(gw-18)*t/span;[p lineToPoint:NSMakePoint(MAX(x,0),y)];if(x<0)break;}
+ p.lineWidth=1.2;p.lineJoinStyle=NSLineJoinStyleRound;
+ [(avg>=55?[NSColor colorWithCalibratedRed:80/255.0 green:1 blue:120/255.0 alpha:1]:avg>=28?[NSColor colorWithCalibratedRed:1 green:230/255.0 blue:40/255.0 alpha:1]:[NSColor colorWithCalibratedRed:1 green:90/255.0 blue:70/255.0 alpha:1]) setStroke];[p stroke];
+ NSString *line=[NSString stringWithFormat:@(TOTK_UI("%.0f 秒  平均 %.0f  最低 %.0f  最高 %.0f  1%% 低 %.0f  最慢 %.0f ms","%.0f s  avg %.0f  min %.0f  max %.0f  1%% low %.0f  worst %.0f ms")),FPS_GRAPH_S,avg,1.0/hi,1.0/lo,1.0/p99,hi*1000];
+ [line drawAtPoint:NSMakePoint(0,b.size.height-top+1) withAttributes:at];}
+@end
 @interface TOTKShortcutHelp:NSView
 @property(strong) NSTextField *label;
+@property(strong) TOTKFpsGraph *graph;
+@property(strong) NSTimer *graphTimer;
 @property(strong) NSTimer *timer;
 @property NSSize textSize;
 -(void)position;
@@ -220,7 +253,9 @@ static NSString *shortcut_text(void){
 }
 -(instancetype)initWithFrame:(NSRect)frame{if((self=[super initWithFrame:frame])){int compact=hud_compact();self.wantsLayer=YES;self.layer.backgroundColor=[NSColor colorWithCalibratedWhite:0.04 alpha:compact?0.72:0.86].CGColor;self.layer.cornerRadius=compact?7:14;self.layer.borderWidth=1;self.layer.borderColor=[NSColor colorWithCalibratedWhite:1 alpha:compact?0.14:0.2].CGColor;
  self.label=[NSTextField labelWithString:shortcut_text()];self.label.font=[NSFont systemFontOfSize:17 weight:NSFontWeightMedium];self.label.textColor=NSColor.whiteColor;self.label.alignment=NSTextAlignmentCenter;self.label.maximumNumberOfLines=0;self.label.lineBreakMode=NSLineBreakByWordWrapping;self.label.frame=NSInsetRect(self.bounds,20,18);self.label.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;[self addSubview:self.label];
- if(compact){self.label.alignment=NSTextAlignmentLeft;self.label.lineBreakMode=NSLineBreakByClipping;}
+ if(compact){self.label.alignment=NSTextAlignmentLeft;self.label.lineBreakMode=NSLineBreakByClipping;
+  self.graph=[[TOTKFpsGraph alloc] initWithFrame:NSZeroRect];self.graph.hidden=YES;[self addSubview:self.graph];
+  __weak TOTKShortcutHelp *w2=self;self.graphTimer=[NSTimer scheduledTimerWithTimeInterval:0.1 repeats:YES block:^(NSTimer *t){(void)t;TOTKShortcutHelp *h=w2;if(h&&!h.hidden&&!h.graph.hidden)h.graph.needsDisplay=YES;}];}
  [self refresh];__weak TOTKShortcutHelp *weak=self;self.timer=[NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t){(void)t;[weak refresh];}];}return self;}
 -(void)refresh{
  if(!hud_compact()){self.label.stringValue=shortcut_text();return;}
@@ -230,6 +265,8 @@ static NSString *shortcut_text(void){
  int full=fps_overlay_full_hud();   // key 1 minimal: the FPS line (line 0) only; the others keep their last text, so skip them
  for(int i=0;i<4;i++){char t[128];int hl=0;if((!full&&i!=0)||!hud_snapshot(i,t,sizeof t,&hl))continue;   // FPS, shaders, render pipelines, load
   [a appendAttributedString:[[NSAttributedString alloc] initWithString:[([NSString stringWithUTF8String:t] ?: @"") stringByAppendingString:@"\n"] attributes:@{NSFontAttributeName:mono,NSForegroundColorAttributeName:hl?yellow:green}]];}
+ BOOL graph=full&&hud_snapshot(0,(char[2]){0},2,NULL);   /* key 1 "all", with the FPS line */
+ if(self.graph.hidden==graph){self.graph.hidden=!graph;[self position];}
  if(!full){if(a.length)[a deleteCharactersInRange:NSMakeRange(a.length-1,1)];   // no empty line under the single FPS line
   else [a appendAttributedString:[[NSAttributedString alloc] initWithString:@"FPS --" attributes:@{NSFontAttributeName:mono,NSForegroundColorAttributeName:green}]];}
  else if(a.length){NSMutableParagraphStyle *gap=[NSMutableParagraphStyle new];gap.paragraphSpacingBefore=4;
@@ -241,7 +278,9 @@ static NSString *shortcut_text(void){
 -(void)viewDidMoveToSuperview{[super viewDidMoveToSuperview];[self position];}
 -(void)layout{[super layout];[self position];}
 -(void)position{if(!self.superview)return;NSRect f,in;
- if(hud_compact()){CGFloat w=self.textSize.width+16,h=self.textSize.height+10,m=10;f=NSMakeRect(floor(self.superview.bounds.size.width-w-m),floor(self.superview.bounds.size.height-h-m),w,h);in=NSMakeRect(8,5,self.textSize.width,self.textSize.height);}
+ if(hud_compact()){CGFloat w=self.textSize.width+16,h=self.textSize.height+10,m=10;CGFloat gh=self.graph&&!self.graph.hidden?FPS_GRAPH_H+6:0;if(gh)w=MAX(w,300);h+=gh;
+  f=NSMakeRect(floor(self.superview.bounds.size.width-w-m),floor(self.superview.bounds.size.height-h-m),w,h);in=NSMakeRect(8,5,self.textSize.width,self.textSize.height);
+  if(gh)self.graph.frame=NSMakeRect(8,5+self.textSize.height+4,w-16,FPS_GRAPH_H);}
  else{CGFloat w=MIN(560,MAX(280,self.superview.bounds.size.width-40)),h=240;f=NSMakeRect(floor((self.superview.bounds.size.width-w)/2),floor((self.superview.bounds.size.height-h)/2),w,h);in=NSInsetRect(NSMakeRect(0,0,w,h),20,18);}
  if(!NSEqualRects(self.frame,f))self.frame=f;self.label.frame=in;}
 @end
