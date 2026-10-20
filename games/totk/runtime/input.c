@@ -191,7 +191,7 @@ static void *input_file(void *arg) {
         } else if (!strncmp(line, "wshot ", 6)) {   /* "wshot <path>": the next shown picture as the window shows it (FPS box and the bottom-left box included) */
             line[strcspn(line, "\r\n")] = 0; if (!line[6]) runtime_fail("diagnostic window screenshot path");
             extern void dm_gfx_window_shot(const char *path); dm_gfx_window_shot(line + 6);
-#ifdef GAME_BOTW
+#ifdef GAME_BOTW160   /* dm_gfx_ashot: the graphics layer built with GAME_BOTW (build/gfx-botw) */
         } else if (!strncmp(line, "ashot ", 6)) {   /* "ashot <path>": the next game frame, written in the background, its present time logged (botw.md) */
             line[strcspn(line, "\r\n")] = 0; if (!line[6]) runtime_fail("diagnostic ashot path");
             extern void dm_gfx_ashot(const char *path); dm_gfx_ashot(line + 6);

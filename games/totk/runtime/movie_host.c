@@ -72,10 +72,11 @@ static int negative(void) { if (g_negative < 0) { const char *e = getenv("TOTK_P
 static uint64_t now_ns(void);
 static uint64_t (*g_clock)(void) = now_ns;
 void movie_host_set_clock(uint64_t (*clock)(void)) { g_clock = clock ? clock : now_ns; }
-/* Breath of the Wild: off by default. The frame pacing holds that game at 30 fps while a movie plays (game_patches_botw.c
+/* Breath of the Wild 1.6.0: off by default. The frame pacing holds that game at 30 fps while a movie plays (game_patches_botw.c
    runtime_game_fps_limit), so it takes every frame at the movie's rate as on the console; dropping late frames left the
-   first tower's cutscene on a black screen after its last frame, the decoder never stopped (2026-10-20). */
-#ifdef GAME_BOTW
+   first tower's cutscene on a black screen after its last frame, the decoder never stopped (2026-10-20). 1.9.0 has no such
+   hold yet and keeps the pacing. */
+#ifdef GAME_BOTW160
 #define MOVIE_PACE_DEFAULT 0
 #else
 #define MOVIE_PACE_DEFAULT 1
