@@ -129,9 +129,9 @@ static NSString *shortcut_text(void){
  else if(w==2560&&h==1440)picture=@(TOTK_UI("原生 2K","native 2K"));
  else if(w!=1920||h!=1080)picture=[NSString stringWithFormat:@(TOTK_UI("原生 %u×%u","native %u×%u")),w,h];
  else picture=@(TOTK_UI("关闭","off"));
-#ifdef GAME_BOTW   /* key 3 only switches MetalFX upscaling to the window; no key 4 (TOTK's ultrawide sites) */
+#ifdef GAME_BOTW   /* key 3 only switches MetalFX upscaling to the window */
  picture=mfxup_output_enabled()?@"MetalFX":@(TOTK_UI("关闭","off"));
- return [NSString stringWithFormat:@(TOTK_UI("快捷键说明\n1  显示 / 隐藏所有提示\n2  补帧：当前 %@（按键切换）\n3  MetalFX 放大：当前 %@（按键切换）","Shortcuts\n1  Show / hide all overlays\n2  Interpolation: %@ (current; press to cycle)\n3  MetalFX upscaling: %@ (current; press to switch)")),[NSString stringWithUTF8String:interp],picture];
+ return [NSString stringWithFormat:@(TOTK_UI("快捷键说明\n1  显示 / 隐藏所有提示\n2  补帧：当前 %@（按键切换）\n3  MetalFX 放大：当前 %@（按键切换）\n4  21:9 宽屏：开 / 关","Shortcuts\n1  Show / hide all overlays\n2  Interpolation: %@ (current; press to cycle)\n3  MetalFX upscaling: %@ (current; press to switch)\n4  Ultrawide 21:9: on / off")),[NSString stringWithUTF8String:interp],picture];
 #else
  return [NSString stringWithFormat:@(TOTK_UI("快捷键说明\n1  显示 / 隐藏所有提示\n2  补帧：当前 %@（按键切换）\n3  画质：当前 %@（按键切换）\n4  21:9 宽屏：开 / 关","Shortcuts\n1  Show / hide all overlays\n2  Interpolation: %@ (current; press to cycle)\n3  Picture: %@ (current; press to cycle)\n4  Ultrawide 21:9: on / off")),[NSString stringWithUTF8String:interp],picture];
 #endif

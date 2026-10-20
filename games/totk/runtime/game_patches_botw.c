@@ -1,6 +1,7 @@
 /* BOTW 1.9.0 game patches (docs/botw-port.md). The output resolution is unchanged; TOTK's output-resolution sites do
    not exist in this main. The functions below keep the interface the frontend and graphics layer call. */
 #include "game_patches.h"
+#include "aspect_patch.h"
 #include "game_version.h"
 #include <stdatomic.h>
 #include <stdio.h>
@@ -143,9 +144,6 @@ static void patch_output_res(Module *m) {
 uint64_t runtime_output_res_extra_bytes(void) { return 0; }
 int runtime_output_res_toggle(void) { return 0; }
 uint64_t runtime_output_size_current(void) { return out_w ? (uint64_t)out_h << 32 | out_w : (uint64_t)1080 << 32 | 1920; }
-/* Key 4 (TOTK's ultrawide, aspect_patch.h): its sites are TOTK's, so BOTW keeps 16:9. */
-int runtime_aspect_toggle(void) { return 0; }
-float runtime_aspect_now(void) { return 0; }
 /* Key 3: MetalFX upscaling of the finished picture to the window (full screen or a large window shows the 1920x1080
    picture bigger; MetalFX instead of the bilinear stretch). The host's output stage (nvn_mtl.m output_upscale) is
    game-independent; TOTK's other stage (its own upscale shader replaced by MetalFX) does not apply to BOTW. The scene
@@ -200,6 +198,13 @@ void runtime_game_patches(Module *m) {
     patch_dynamic_res(m);
     patch_scene_width(m);
     patch_output_res(m);
+    /* Key 4, ultrawide (aspect_patch.h). The places that hand the camera its aspect ratio, as a community 21:9 mod for
+       emulators changes them in 1.9.0 (only its addresses are used): three viewport routines dividing width by height
+       (fdiv s0, s0, s1) and the camera's ratio getter (ldr s0, [x0, #0xb0], the same sead field as TOTK). That mod also
+       sets the 16:9 constant at main+0x16a18b8 in read-only data, which a key cannot follow; left as it is. The stubs go
+       to main's text padding (0x390 bytes before the read-only data), the frame-step veneer to the file's padding. */
+    { static const uint64_t sites[] = {0xc2ab70, 0xeb4a28, 0x10edb0c, 0x10ee114};
+      aspect_install(m, TOTK_GAME_VERSION, sites, 4, (m->text_end + 15) & ~15ULL, (m->file_size + 0x3fff) & ~0x3fffULL); }
     const char *e = getenv("TOTK_FPS60");
     if (e && !strcmp(e, "0")) {
         fprintf(stderr, "[totk] BOTW %s: shipping frame controller (TOTK_FPS60=0)\n", TOTK_GAME_VERSION);
