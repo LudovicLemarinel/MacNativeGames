@@ -8,6 +8,8 @@
 #include "runtime.h"
 #include "game_version.h"
 #include "totk_ui_lang.h"
+#include "../third_party/d2r_gfx/gfx/nvn/totk_mfx_mode.h"
+int mfxup_output_enabled(void);
 static NSWindow *window;
 uint64_t dm_nvn_frame_count(void);   /* gfx/nvn/hle_nvn.c: game frames presented so far */
 static CAMetalLayer *metalLayer;
@@ -42,6 +44,17 @@ void runtime_boot_progress(const char *stage,uint64_t done,uint64_t total){
   if(total){bootDetail.stringValue=[NSString stringWithFormat:@"%.1f / %.1f GB",done/1e9,total/1e9];
    bootProgress.indeterminate=NO;bootProgress.doubleValue=(double)done/(double)total*100.0;}
   else {bootDetail.stringValue=@(TOTK_UI("正在处理，请稍候","Working, please wait"));bootProgress.indeterminate=YES;[bootProgress startAnimation:nil];}
+ });
+}
+void runtime_boot_count(const char *stage,uint64_t done,uint64_t total){
+ /* Steps counted in items, not bytes (the shader import: tens of thousands of files, minutes on a phone). */
+ static const char *last;
+ if(stage!=last){fprintf(stderr,"[totk-boot] %.3f %s\n",bootStartNS?(runtime_now_ns()-bootStartNS)/1e9:0,stage?stage:"startup");last=stage;}
+ NSString *s=[NSString stringWithUTF8String:stage?stage:TOTK_UI("正在启动","Starting")];
+ dispatch_async(dispatch_get_main_queue(), ^{
+  if(!bootOverlay||bootOverlay.hidden)return;
+  bootStage.stringValue=s;bootDetail.stringValue=[NSString stringWithFormat:@"%llu / %llu",(unsigned long long)done,(unsigned long long)total];
+  if(total){bootProgress.indeterminate=NO;bootProgress.doubleValue=(double)done/(double)total*100.0;}
  });
 }
 void runtime_boot_status(const char *stage,const char *detail){
@@ -96,22 +109,44 @@ static CVReturn vsync_callback(CVDisplayLinkRef link,const CVTimeStamp *now,cons
 @property(strong) NSTimer *timer;
 @property NSSize textSize;
 -(void)position;
+-(void)refresh;
 @end
 /* Compact HUD (default): one small box in the window's top-right corner with the FPS, shader and load lines (published by
    gfx/nvn/fps_overlay.c, refreshed twice a second) above the shortcuts. TOTK_HUD=corners: the lines stay in the picture's
    corners and this is the larger centred shortcut box. */
 @implementation TOTKShortcutHelp
-static NSString *shortcut_text(void){return @(TOTK_UI("快捷键说明\n1  显示 / 隐藏所有提示\n2  补帧：关 → 30+30 → 刷新率一半 → 不限帧\n3  画质：MetalFX 2K → 原生 2K → 关闭","Shortcuts\n1  Show / hide all overlays\n2  Frame interpolation: off → 30+30 → half refresh rate → unlimited\n3  Picture: MetalFX 2K → native 2K → off"));}
+static NSString *shortcut_text(void){
+ const char *interp;
+ switch(mfx_enabled()){
+  case MFX_30:interp="30+30";break;
+  case MFX_HALF:interp=TOTK_UI("刷新率一半","half refresh rate");break;
+  case MFX_MAX:interp=TOTK_UI("不限帧","unlimited");break;
+  default:interp=TOTK_UI("关闭","off");break;
+ }
+ uint64_t size=runtime_output_size_current();unsigned w=(uint32_t)size,h=(uint32_t)(size>>32);
+ NSString *picture;
+ if(mfxup_output_enabled())picture=@"MetalFX 2K";
+ else if(w==2560&&h==1440)picture=@(TOTK_UI("原生 2K","native 2K"));
+ else if(w!=1920||h!=1080)picture=[NSString stringWithFormat:@(TOTK_UI("原生 %u×%u","native %u×%u")),w,h];
+ else picture=@(TOTK_UI("关闭","off"));
+#ifdef GAME_BOTW   /* key 3 only switches MetalFX upscaling to the window; no key 4 (TOTK's ultrawide sites) */
+ picture=mfxup_output_enabled()?@"MetalFX":@(TOTK_UI("关闭","off"));
+ return [NSString stringWithFormat:@(TOTK_UI("快捷键说明\n1  显示 / 隐藏所有提示\n2  补帧：当前 %@（按键切换）\n3  MetalFX 放大：当前 %@（按键切换）","Shortcuts\n1  Show / hide all overlays\n2  Interpolation: %@ (current; press to cycle)\n3  MetalFX upscaling: %@ (current; press to switch)")),[NSString stringWithUTF8String:interp],picture];
+#else
+ return [NSString stringWithFormat:@(TOTK_UI("快捷键说明\n1  显示 / 隐藏所有提示\n2  补帧：当前 %@（按键切换）\n3  画质：当前 %@（按键切换）\n4  21:9 宽屏：开 / 关","Shortcuts\n1  Show / hide all overlays\n2  Interpolation: %@ (current; press to cycle)\n3  Picture: %@ (current; press to cycle)\n4  Ultrawide 21:9: on / off")),[NSString stringWithUTF8String:interp],picture];
+#endif
+}
 -(instancetype)initWithFrame:(NSRect)frame{if((self=[super initWithFrame:frame])){int compact=hud_compact();self.wantsLayer=YES;self.layer.backgroundColor=[NSColor colorWithCalibratedWhite:0.04 alpha:compact?0.72:0.86].CGColor;self.layer.cornerRadius=compact?7:14;self.layer.borderWidth=1;self.layer.borderColor=[NSColor colorWithCalibratedWhite:1 alpha:compact?0.14:0.2].CGColor;
  self.label=[NSTextField labelWithString:shortcut_text()];self.label.font=[NSFont systemFontOfSize:17 weight:NSFontWeightMedium];self.label.textColor=NSColor.whiteColor;self.label.alignment=NSTextAlignmentCenter;self.label.maximumNumberOfLines=0;self.label.lineBreakMode=NSLineBreakByWordWrapping;self.label.frame=NSInsetRect(self.bounds,20,18);self.label.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;[self addSubview:self.label];
- if(compact){self.label.alignment=NSTextAlignmentLeft;self.label.lineBreakMode=NSLineBreakByClipping;[self refresh];
-  __weak TOTKShortcutHelp *weak=self;self.timer=[NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t){(void)t;[weak refresh];}];}}return self;}
+ if(compact){self.label.alignment=NSTextAlignmentLeft;self.label.lineBreakMode=NSLineBreakByClipping;}
+ [self refresh];__weak TOTKShortcutHelp *weak=self;self.timer=[NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t){(void)t;[weak refresh];}];}return self;}
 -(void)refresh{
+ if(!hud_compact()){self.label.stringValue=shortcut_text();return;}
  NSFont *mono=[NSFont monospacedSystemFontOfSize:10.5 weight:NSFontWeightMedium],*small=[NSFont systemFontOfSize:10];
  NSColor *green=[NSColor colorWithCalibratedRed:80/255.0 green:1 blue:120/255.0 alpha:1],*yellow=[NSColor colorWithCalibratedRed:1 green:230/255.0 blue:40/255.0 alpha:1];
  NSMutableAttributedString *a=[NSMutableAttributedString new];
  for(int i=0;i<3;i++){char t[128];int hl=0;if(!hud_snapshot(i,t,sizeof t,&hl))continue;
-  [a appendAttributedString:[[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"%s\n",t] attributes:@{NSFontAttributeName:mono,NSForegroundColorAttributeName:hl?yellow:green}]];}
+  [a appendAttributedString:[[NSAttributedString alloc] initWithString:[([NSString stringWithUTF8String:t] ?: @"") stringByAppendingString:@"\n"] attributes:@{NSFontAttributeName:mono,NSForegroundColorAttributeName:hl?yellow:green}]];}
  if(a.length){NSMutableParagraphStyle *gap=[NSMutableParagraphStyle new];gap.paragraphSpacingBefore=4;
   [a appendAttributedString:[[NSAttributedString alloc] initWithString:shortcut_text() attributes:@{NSFontAttributeName:small,NSForegroundColorAttributeName:[NSColor colorWithCalibratedWhite:0.75 alpha:1],NSParagraphStyleAttributeName:gap}]];}
  else [a appendAttributedString:[[NSAttributedString alloc] initWithString:shortcut_text() attributes:@{NSFontAttributeName:small,NSForegroundColorAttributeName:[NSColor colorWithCalibratedWhite:0.75 alpha:1]}]];
@@ -122,7 +157,7 @@ static NSString *shortcut_text(void){return @(TOTK_UI("快捷键说明\n1  显�
 -(void)layout{[super layout];[self position];}
 -(void)position{if(!self.superview)return;NSRect f,in;
  if(hud_compact()){CGFloat w=self.textSize.width+16,h=self.textSize.height+10,m=10;f=NSMakeRect(floor(self.superview.bounds.size.width-w-m),floor(self.superview.bounds.size.height-h-m),w,h);in=NSMakeRect(8,5,self.textSize.width,self.textSize.height);}
- else{CGFloat w=MIN(560,MAX(280,self.superview.bounds.size.width-40)),h=140;f=NSMakeRect(floor((self.superview.bounds.size.width-w)/2),floor((self.superview.bounds.size.height-h)/2),w,h);in=NSInsetRect(NSMakeRect(0,0,w,h),20,18);}
+ else{CGFloat w=MIN(560,MAX(280,self.superview.bounds.size.width-40)),h=168;f=NSMakeRect(floor((self.superview.bounds.size.width-w)/2),floor((self.superview.bounds.size.height-h)/2),w,h);in=NSInsetRect(NSMakeRect(0,0,w,h),20,18);}
  if(!NSEqualRects(self.frame,f))self.frame=f;self.label.frame=in;}
 @end
 void runtime_shortcut_help_toggle(void){int show=fps_overlay_toggle_hints();dispatch_async(dispatch_get_main_queue(), ^{shortcutHelp.hidden=!show;});}
@@ -170,7 +205,7 @@ void runtime_front_request_close(void){dispatch_async(dispatch_get_main_queue(),
 static void front_install_menu(void){
  NSMenu *menu=[NSMenu new],*appMenu=[NSMenu new];
  NSMenuItem *appItem=[NSMenuItem new];appItem.submenu=appMenu;[menu addItem:appItem];
- NSMenuItem *quit=[[NSMenuItem alloc] initWithTitle:@"Quit " GAME_DISPLAY_NAME action:@selector(performClose:) keyEquivalent:@"q"];
+ NSMenuItem *quit=[[NSMenuItem alloc] initWithTitle:@(TOTK_UI("退出 " GAME_DISPLAY_NAME_ZH,"Quit " GAME_DISPLAY_NAME)) action:@selector(performClose:) keyEquivalent:@"q"];
  quit.keyEquivalentModifierMask=NSEventModifierFlagCommand;quit.target=window;
  [appMenu addItem:quit];NSApp.mainMenu=menu;
 }

@@ -66,8 +66,10 @@ extern __thread sigjmp_buf *runtime_fault_guard;   // runtime/loader.c: a guarde
 // Function parameters in this file are never retained again in the callee (the caller / global tables already hold them, and lifetime is guaranteed by defer_obj_release): saves a retain / release pair per call on the hot path
 #pragma clang attribute push(__attribute__((objc_externally_retained)), apply_to = function)
 
-#define MLOG(...) do { fprintf(stderr, "[dm] [nvn-mtl] " __VA_ARGS__); fputc('\n', stderr); } while (0)
+#define MLOG(...) do { flockfile(stderr); fprintf(stderr, "[dm] [nvn-mtl] " __VA_ARGS__); fputc('\n', stderr); funlockfile(stderr); } while (0)   // one whole line even when the warm-up threads log at once
 #define MDIE(...) do { MLOG("FATAL " __VA_ARGS__); abort(); } while (0)
+#define TOTK_SERIAL_SET_FAIL() MDIE("serial history: out of memory")
+#include "totk_serial_set.h"
 
 static void warm_start(void);
 static void warm_claim(void);
@@ -275,13 +277,16 @@ static void res_site_report(int top) {
     }
     pthread_mutex_unlock(&g_res_mu);
 }
-/* GPU memory budget: TOTK_GPU_BUDGET_MB, default 40% of physical memory (0 disables). Checked before every submission and
-   residency commit, in the no-submit mode too, so the growth is reported with its sites instead of exhausting wired memory. */
+/* GPU memory budget: TOTK_GPU_BUDGET_MB, default 40% of physical memory on the Mac (0 disables). Checked before every
+   submission and residency commit, in the no-submit mode too, so the growth is reported with its sites instead of
+   exhausting wired memory. Off by default on iOS: there the system's per-app limit bounds GPU memory and ends only the app,
+   and 40% of an iPhone 14 (2284 MB) stopped the game in the world while it used 3.6 of its 4 GB (2026-10-19). */
 static uint64_t gpu_budget_bytes(void) {
     static uint64_t b; static int init;
     if (!init) {
         init = 1; const char *e = getenv("TOTK_GPU_BUDGET_MB");
         if (e) b = strtoull(e, NULL, 10) << 20;
+        else if (TARGET_OS_IPHONE) b = 0;
         else { uint64_t phys = 0; size_t n = sizeof phys; if (sysctlbyname("hw.memsize", &phys, &n, NULL, 0) || !phys) MDIE("hw.memsize unavailable for the GPU memory budget"); b = phys / 5 * 2; }
         MLOG("显存预算 %llu MB（TOTK_GPU_BUDGET_MB 覆盖，0 关闭）", (unsigned long long)(b >> 20));
     }
@@ -339,7 +344,7 @@ static void defer_obj_release_ex(id obj, int keep_resident) {
 }
 static void defer_obj_release(id obj) { defer_obj_release_ex(obj, 0); }
 static void defer_obj_unref(id obj) { defer_obj_release_ex(obj, 1); }
-static void defer_drain(void) {
+static void defer_drain(void) { @autoreleasepool {   // also called from GPU completion handlers
     NSMutableArray<NvDeferredRelease *> *ready = [NSMutableArray array];
     pthread_mutex_lock(&g_deferred_mu);
     for (NSInteger i = g_deferred.count - 1; i >= 0; i--) {
@@ -357,7 +362,7 @@ static void defer_drain(void) {
         }
         d->object = nil;
     }
-}
+} }
 
 static pthread_mutex_t g_bf_want_mu = PTHREAD_MUTEX_INITIALIZER;
 static char **g_bf_want_keys; static size_t g_bf_want_n, g_bf_want_cap; static int g_bf_want_loaded;
@@ -907,6 +912,8 @@ static void zskip_clear(void);
 static int tbdr_on(void);
 static id g_cb;
 static id<MTL4ComputeCommandEncoder> g_blit;
+static int g_blit_alias; // shared encoder may have accessed aliased buffer storage
+static int g_copy_probe_no_alias; // probe-gpu-copy-alias negative control only: copies without alias visibility
 static NSMutableArray<dispatch_block_t> *g_commit_blocks;
 static uint64_t g_alloc_fence[ALLOC_MAX]; static uint64_t g_alloc_waits, g_alloc_grown;
 int mtl_wait(uint64_t fence, uint64_t timeout_ns);
@@ -961,6 +968,11 @@ static int g_sub_chunks; static uint64_t g_chunk_mark, g_stat_draw; static void 
 static int g_nupd, g_nshadow; static inline int upd_guard(uint64_t lo, uint64_t hi);   // renamed uniform updates, defined with mtl_sub_update
 void mtl_sub_begin(void) {
     g_fc_begin0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    /* The submission's autorelease pool, drained in mtl_sub_commit, opens before anything else: the guest's submit
+       thread has no pool of its own that drains (frontend.m's lasts the whole game), so what defer_drain, defer_reset,
+       warm_claim and pt_apply_request autoreleased before it piled up every submission (nxnative found the same leak:
+       an iPhone killed for memory in a shrine, docs/agents/04-graphics.md). */
+    g_sub_pool = objc_autoreleasePoolPush();
     if (g_cg.ng) { static int once; if (!once++) MLOG("【红】[cube-merge] 上次提交结束时还有 %d 组没落地（不应发生）", g_cg.ng); g_cg.ng = 0; } g_cg_pending = 0; g_cg.take_seq = ~0ull;
     mtl_init(); g_sub_serial++;
     { static int ka; if (!ka) { ka = 1; keepalive_start(); } atomic_store(&g_last_sub_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW)); }
@@ -972,7 +984,6 @@ void mtl_sub_begin(void) {
     pt_apply_request();
     g_sub_thread = pthread_self(); atomic_store(&g_sub_thread_set, 1);
     atomic_store(&g_last_commit_error, 0);
-    g_sub_pool = objc_autoreleasePoolPush();
     g_cb = [g_dev newCommandBuffer];
     // 不在帧中间等 GPU（真机热态：固定 3 个轮转时 GPU 跟不上就每帧在这里阻塞，提交线程睡醒后按低频跑，指令数 −18% 而 CPU 时间 +49%）：
     // 挑一个 GPU 已用完的分配器；都在用就新建；到上限才等最老的那个。超前量由游戏取交换链贴图处的等待约束，与旧接口相同。
@@ -1026,7 +1037,12 @@ static void ser_gate(void) {
 static int bar_end_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_BARRIER_END"); v = !(e && !strcmp(e, "0")); if (!v) fprintf(stderr, "[dm] [nvn-mtl] 【实验】TOTK_BARRIER_END=0：编码器结束处不设生产者屏障\n"); } return v; }
 static int bar_start_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_BARRIER_START"); v = !(e && !strcmp(e, "0")); if (!v) fprintf(stderr, "[dm] [nvn-mtl] 【实验】TOTK_BARRIER_START=0：回放编码器开头不设消费者屏障（有数据竞争，只供测量）\n"); } return v; }
 static MTL4VisibilityOptions bar_vis(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_BARRIER_VIS"); v = !(e && !strcmp(e, "0")); if (!v) fprintf(stderr, "[dm] [nvn-mtl] 【实验】TOTK_BARRIER_VIS=0：回放编码器开头屏障不带缓存可见性\n"); } return v ? MTL4VisibilityOptionDevice : MTL4VisibilityOptionNone; }
+static MTL4VisibilityOptions blit_vis(void) { return bar_vis() | (g_blit_alias ? MTL4VisibilityOptionResourceAlias : 0); }
 static inline void m4_end(id e) {
+    if (e == g_blit && g_blit_alias) {
+        [g_blit barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionResourceAlias];
+        g_blit_alias = 0;
+    }
     if (bar_end_on() && [e conformsToProtocol:@protocol(MTL4CommandEncoder)]) [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
     [e endEncoding];
 }
@@ -1222,10 +1238,20 @@ static uint64_t g_blit_opens, g_blit_splits, g_upd_n, g_upd_split, g_copy_n, g_c
    test read a stale value 1 time in 3). The barrier when the encoder opens only orders it against earlier encoders. On
    Metal 4 the copy encoder is a compute encoder, so both blit and dispatch stages are ordered. TOTK_BLIT_BAR=0: off. */
 static int blit_bar_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_BLIT_BAR"); v = !e || atoi(e); } return v; }
-static id<MTL4ComputeCommandEncoder> blit(void) { blit_note(); if (!g_blit) { g_blit_opens++; g_blit_splits += g_enc != nil; } rp_end();
-    if (!g_blit) { rs_sync(); ser_gate(); pt_mark(g_cb, 'B', nil); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:bar_vis()]; }
-    else if (blit_bar_on()) [g_blit barrierAfterEncoderStages:MTLStageBlit | MTLStageDispatch beforeEncoderStages:MTLStageBlit | MTLStageDispatch visibilityOptions:bar_vis()];
+static id<MTL4ComputeCommandEncoder> blit_kind(int buffer_alias) { blit_note(); if (!g_blit) { g_blit_opens++; g_blit_splits += g_enc != nil; } rp_end();
+    if (buffer_alias && !g_copy_probe_no_alias) g_blit_alias = 1; // rp_end may itself open and close a copy encoder
+    if (!g_blit) { rs_sync(); ser_gate(); pt_mark(g_cb, 'B', nil); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:blit_vis()]; }
+    else if (blit_bar_on()) [g_blit barrierAfterEncoderStages:MTLStageBlit | MTLStageDispatch beforeEncoderStages:MTLStageBlit | MTLStageDispatch visibilityOptions:blit_vis()];
     return g_blit; }
+static id<MTL4ComputeCommandEncoder> blit(void) { return blit_kind(0); }
+/* Buffer copies (mtl_sub_copy, the copy fallback of inline uniform updates). The same memory can be reached through two Metal
+   buffers, each with its own GPU virtual address: a virtual pool's remapped view of a physical pool, or two pools over the same
+   CPU memory. Device visibility alone does not make a write through one visible to a read through the other: a chain of copies
+   through two no-copy buffers over one allocation read stale bytes on every run (probe-gpu-copy-alias). So every buffer-copy
+   segment carries alias visibility in the barriers it keeps and at the encoder end (original port d309e62, Codex). The ranges
+   are unused here; the original port's copy-batch experiment (off by default) takes the same call. */
+static id<MTL4ComputeCommandEncoder> blit_buffer(id<MTLBuffer> src, NSUInteger so, id<MTLBuffer> dst, NSUInteger d, NSUInteger n) {
+    (void)src; (void)so; (void)dst; (void)d; (void)n; return blit_kind(1); }
 
 /* TOTK: collect and copy the uniform ranges a submission binds (see usnap_t). */
 static size_t arena_alloc(size_t n, id<MTLBuffer> *buf);
@@ -1474,7 +1500,7 @@ void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
     void *sb, *db; uint64_t so, dof;
     if (!mtl_addr(src, n, &sb, &so) || !mtl_addr(dst, n, &db, &dof))
         MDIE("缓冲拷贝地址不在任何内存池内 src=%#llx dst=%#llx n=%#llx", (unsigned long long)src, (unsigned long long)dst, (unsigned long long)n);
-    enc_b_copy_buffer(blit(), (__bridge id<MTLBuffer>)sb, so, (__bridge id<MTLBuffer>)db, dof, n);
+    enc_b_copy_buffer(blit_buffer((__bridge id<MTLBuffer>)sb, so, (__bridge id<MTLBuffer>)db, dof, n), (__bridge id<MTLBuffer>)sb, so, (__bridge id<MTLBuffer>)db, dof, n);
 }
 
 // TOTK: uniform updates carry their data inline in the (host-owned) recording; stage it in this submit's
@@ -1644,7 +1670,7 @@ static void mtl_sub_update(const void *data, uint64_t dst, uint64_t n) {
     }
     if (ub_rename_on()) { g_ren_fallback++; upd_flush(); }   // pending table full: keep the order with a real copy
     usnap_drop(dst, n);   // TOTK: the update reaches memory on the GPU timeline; later readers read it there
-    enc_b_copy_buffer(blit(), sb, so, (__bridge id<MTLBuffer>)db, dof, n);
+    enc_b_copy_buffer(blit_buffer(sb, so, (__bridge id<MTLBuffer>)db, dof, n), sb, so, (__bridge id<MTLBuffer>)db, dof, n);
 }
 static void post(post_op o) {
     if (g_npost == g_postcap) { g_postcap = g_postcap ? g_postcap * 2 : 64; g_post = realloc(g_post, g_postcap * sizeof *g_post); }
@@ -2129,18 +2155,18 @@ static void ser_bump(uint64_t serial) { pthread_mutex_lock(&g_smu); ser_bump_loc
    stored it under the serial, where nothing ever deleted it: about 4.6 textures (~18 MB) leaked per frame, the
    residency set grew without bound and the GPU driver ran out of wired memory (kernel panics). A texture created
    for a dead serial is now deleted again when the submission that used it completes. */
-static nvn_hmap g_dead_serial = {.klen = 8};   // serial -> (void *)1 once finalized
+static totk_serial_set g_dead_serial;   // serial -> (void *)1 once finalized
 /* TOTK: serials the GPU has rendered into. A mirrored (CPU-pool) texture that the game then uses as a render target is owned by
    the GPU from that point: dirty-page re-uploads from the (stale) pool memory would wipe the rendered content. */
-static nvn_hmap g_gpu_owned = {.klen = 8};
+static totk_serial_set g_gpu_owned;
 static _Atomic uint64_t g_owned_gen = 1;   // TOTK: bumped whenever a serial joins g_gpu_owned (entries are never removed)
 static void pkg_owned_locked(uint64_t k);
-static void gpu_owned_mark(uint64_t k) { pthread_mutex_lock(&g_smu); int had = nvn_hm_get(&g_gpu_owned, &k) != NULL; if (!had) { nvn_hm_put(&g_gpu_owned, &k, (void *)1); atomic_fetch_add(&g_owned_gen, 1); pkg_owned_locked(k); } pthread_mutex_unlock(&g_smu);
+static void gpu_owned_mark(uint64_t k) { pthread_mutex_lock(&g_smu); int had = totk_serial_has(&g_gpu_owned, k); if (!had) { totk_serial_add(&g_gpu_owned, k); atomic_fetch_add(&g_owned_gen, 1); pkg_owned_locked(k); } pthread_mutex_unlock(&g_smu);
 }
-static int gpu_owned(uint64_t k) { pthread_mutex_lock(&g_smu); int d = nvn_hm_get(&g_gpu_owned, &k) != NULL; pthread_mutex_unlock(&g_smu); return d; }
+static int gpu_owned(uint64_t k) { pthread_mutex_lock(&g_smu); int d = totk_serial_has(&g_gpu_owned, k); pthread_mutex_unlock(&g_smu); return d; }
 
 static uint64_t *g_dead_put; static int g_dead_put_n, g_dead_put_cap; static uint64_t g_dead_put_total;
-static int serial_is_dead(uint64_t k) { pthread_mutex_lock(&g_smu); int d = nvn_hm_get(&g_dead_serial, &k) != NULL; pthread_mutex_unlock(&g_smu); return d; }
+static int serial_is_dead(uint64_t k) { pthread_mutex_lock(&g_smu); int d = totk_serial_has(&g_dead_serial, k); pthread_mutex_unlock(&g_smu); return d; }
 static void dead_put_note(uint64_t k) {
     pthread_mutex_lock(&g_smu);
     if (g_dead_put_n == g_dead_put_cap) { g_dead_put_cap = g_dead_put_cap ? g_dead_put_cap * 2 : 256; g_dead_put = realloc(g_dead_put, g_dead_put_cap * sizeof *g_dead_put); if (!g_dead_put) MDIE("dead-serial list"); }
@@ -2306,6 +2332,8 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "skip_invisible")) { skv_set(v); return; }
     if (!strcmp(name, "mfx_upscale")) { mfxup_set(v < 0 ? !mfxup_enabled() : v); return; }   // TOTK_MFX_UPSCALE at run time (manual key 3 picture mode)
     if (!strcmp(name, "mfx_interp")) { mfx_set(v); return; }
+    if (!strcmp(name, "draw_log")) { extern _Atomic long g_draw_log; atomic_store(&g_draw_log, v); MLOG("[flag] draw_log: every draw and dispatch of the next %d frames", v); return; }
+    if (!strcmp(name, "uw_log")) { extern _Atomic long g_uw_log; atomic_store(&g_uw_log, v); MLOG("[flag] uw_log: canvas draws of the next %d frames", v); return; }   // key 4 UI squeeze diagnostic
     if (!strcmp(name, "mfx_output")) { mfxup_output_set(v < 0 ? !mfxup_output_enabled() : v); return; }   // TOTK_MFX_OUTPUT at run time (the window output stage)
     if (!strcmp(name, "pass_gpu")) {
         if (v < 0 || v > 120) { MLOG("[flag] pass_gpu requires 0..120 frames"); return; }
@@ -2448,6 +2476,22 @@ static int wb_level_back(const tex_t *t, id<MTLTexture> mt, unsigned level, unsi
     g_wb_bytes += lp * lr;
     return 1;
 }
+static void wb_write_list(wb_ent **list, int nl, int force);
+/* Diagnostic TOTK_WB_EAGER=<w>x<h>: at every present, renderings of mirrored textures of that size are written back to
+   memory without waiting for the game's invalidate (to see whether the CPU reads them from an uncached pool). */
+void mtl_wb_eager(void) {
+    static int on = -1; static unsigned w, h; if (on < 0) { const char *e = getenv("TOTK_WB_EAGER"); on = e && sscanf(e, "%ux%u", &w, &h) == 2; if (on) MLOG("TOTK_WB_EAGER: %ux%u renderings written back every frame", w, h); }
+    if (!on || !atomic_load(&g_wb_on)) return;
+    pthread_mutex_lock(&g_smu);
+    wb_ent *list[512]; int nl = 0;
+    for (uint32_t i = 0; i < g_wb.cap && nl < 512 && g_wb.n; i++) {
+        wb_ent *e = g_wb.vals ? g_wb.vals[i] : NULL;
+        if (!e || e->t.d.width != w || e->t.d.height != h) continue;
+        uint64_t k = e->t.serial; nvn_hm_del(&g_wb, &k); list[nl++] = e; i = (uint32_t)-1;
+    }
+    pthread_mutex_unlock(&g_smu);
+    wb_write_list(list, nl, 1);
+}
 void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
     if (!p || !p->mem || !atomic_load(&g_wb_on)) return;
     pthread_mutex_lock(&g_smu);
@@ -2460,6 +2504,10 @@ void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
         uint64_t k = e->t.serial; nvn_hm_del(&g_wb, &k); list[nl++] = e; i = (uint32_t)-1;   // deletion shifts entries: rescan
     }
     pthread_mutex_unlock(&g_smu);
+    wb_write_list(list, nl, 0);
+}
+/* Writes the listed renderings back to memory (the entries are freed); force: even over CPU writes since the render. */
+static void wb_write_list(wb_ent **list, int nl, int force) {
     if (!nl) return;
     { extern void nvn_x_drain(void) __attribute__((weak)); if (nvn_x_drain) nvn_x_drain(); }   // translation thread: nothing queued overtakes this read-back (as for ReadTexels)
     mtl_finish_gpu();
@@ -2467,7 +2515,7 @@ void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
        of several renderings of the same memory (texture objects over it) only the newest is written back. */
     int fresh[512];
     for (int i = 0; i < nl; i++) { const wb_ent *e = list[i];
-        fresh[i] = !nvn_dirty_since(e->t.mem, e->t.L.size, e->stamp) || (e->snap && !memcmp(e->snap, e->t.mem, e->t.L.size)); }   // see WB_SNAP
+        fresh[i] = force || !nvn_dirty_since(e->t.mem, e->t.L.size, e->stamp) || (e->snap && !memcmp(e->snap, e->t.mem, e->t.L.size)); }   // see WB_SNAP
     for (int i = 0; i < nl; i++) for (int j = 0; j < nl; j++)
         if (i != j && fresh[i] && fresh[j] && list[j]->t.mem == list[i]->t.mem && list[j]->stamp > list[i]->stamp) { fresh[i] = 2; break; }   // 2: superseded
     for (int i = 0; i < nl; i++) {
@@ -2475,7 +2523,7 @@ void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
         id o = (__bridge id)e->obj; id<MTLTexture> mt = [o isKindOfClass:[NvPkg class]] ? ((NvPkg *)o)->tex : o;
         uint32_t upf; int ubpp;
         if (fresh[i] == 2 || !mt) { wb_ent_free(e); continue; }   // !mt: copy evicted (pkg_evict_sweep) before the GPU rendered into it
-        TILELOG(t, "invalidate %#llx+%#llx: %s", (unsigned long long)(uintptr_t)a, (unsigned long long)n, !fresh[i] ? "CPU wrote since the render, skip" : "write back");
+        TILELOG(t, "write-back request: %s", !fresh[i] ? "CPU wrote since the render, skip" : "write back");
         if (tilelog_match(t) && !fresh[i]) {   // who wrote it
             extern int runtime_module_offset(uint64_t pc, const char **name, uint64_t *off);
             nvn_dirty_rec rec[64]; int nr = nvn_dirty_recent((uintptr_t)t->mem & ~(uintptr_t)16383, (uintptr_t)t->mem + t->L.size, rec, 64);
@@ -2489,7 +2537,10 @@ void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
             }
             TILELOG(t, "writers since the render (%d records):%s", nr, line);
         }
-        if (!fresh[i]) { g_wb_skip_cpu++; wb_ent_free(e); continue; }   // the CPU wrote it since: its bytes are newer
+        if (!fresh[i]) {   // the CPU wrote it since: its bytes are newer
+            if (++g_wb_skip_cpu <= 24) MLOG("[writeback] skipped (CPU wrote since the render) ser=%llu %ux%u nvnfmt=%#x lv%u", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.levels);
+            wb_ent_free(e); continue;
+        }
         if (!mt || bc_unpack(t->d.format, &upf, &ubpp) || t->d.target == 2 || t->d.samples > 1) { if (++g_wb_skip_fmt <= 8) MLOG("【红】GPU 写回内存：不支持的贴图 ser=%llu 格式 %#x 目标 %d", (unsigned long long)t->serial, t->d.format, t->d.target); wb_ent_free(e); continue; }
         /* the GPU's bytes landing in memory: not a CPU write (with dm_guest_write_prepare the page this texture shares
            with a neighbour counted as written, and the neighbour's own write-back was skipped as "CPU wrote since") */
@@ -3509,8 +3560,9 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     int live = 0, peak = 0, cap = 0; nvn_dirty_stat(&live, &peak, &cap);
     MLOG("内存 至帧 %llu：常驻 %llu MB，显卡已分配 %llu MB，延迟释放队列 %lu，驻留集 %lu 个，内存池 %d 个（峰值 %d / 跟踪表容量 %d），贴图重传累计 %llu 次", frame, rss_mb, gpu, nd, nr, live, peak, cap, (unsigned long long)g_pkg_reuploads);
     MLOG("已死序号纹理累计 %llu 张（替换前即为泄漏来源）", (unsigned long long)g_dead_put_total);
-    pthread_mutex_lock(&g_smu); unsigned dead_n = g_dead_serial.n, owned_n = g_gpu_owned.n; pthread_mutex_unlock(&g_smu);
-    MLOG("序号表：已销毁 %u 个，GPU 画过 %u 个（两张表都只增不减，见 mtl_dead_forget）", dead_n, owned_n);
+    pthread_mutex_lock(&g_smu); uint64_t dead_n = g_dead_serial.n, owned_n = g_gpu_owned.n;
+    uint64_t serial_bytes = g_dead_serial.bytes + g_gpu_owned.bytes, serial_pages = g_dead_serial.pages + g_gpu_owned.pages; pthread_mutex_unlock(&g_smu);
+    MLOG("序号表：已销毁 %llu 个，GPU 画过 %llu 个（两张表都只增不减，见 mtl_dead_forget；分页位图 %llu 页，%llu 字节）", (unsigned long long)dead_n, (unsigned long long)owned_n, (unsigned long long)serial_pages, (unsigned long long)serial_bytes);
     pthread_mutex_lock(&g_smu); int ndet = g_stor_ndet; pthread_mutex_unlock(&g_smu);
     MLOG("可压缩贴图跨格式换主 %llu 次（其中换回原贴图 %llu 次），暂存旧登记 %d 个（TOTK_COMPRESSED_ALIAS=1 恢复跨格式共用）", (unsigned long long)g_stor_handover, (unsigned long long)g_stor_taken_back, ndet);
     MLOG("共享存储贴图：条目 %llu，共用 %llu 次，格式视图 %llu 次，重建 %llu 次，闲置回收 %llu，随内存池释放 %llu", (unsigned long long)g_stor_entries, (unsigned long long)g_stor_shared, (unsigned long long)g_stor_viewed, (unsigned long long)g_stor_recreated, (unsigned long long)g_stor_swept, (unsigned long long)g_stor_dropped);
@@ -3539,7 +3591,7 @@ void mtl_tex_release(tex_t *t) {
     { stor_key k; __unsafe_unretained id o = serial_get(t->serial);   // a mirrored texture the GPU rendered into keeps its content for later uses of this storage (g_dead_keep)
       if ([o isKindOfClass:[NvPkg class]] && ((NvPkg *)o)->owned && ((NvPkg *)o)->tex && stor_key_of(t, &k)) { NvPkg *pk = o; if (!pk->dead_kept) dead_keep_put(&k, pk->tex); pk->dead_kept = 1; } }
     serial_del(t->serial);
-    pthread_mutex_lock(&g_smu); nvn_hm_put(&g_dead_serial, &t->serial, (void *)1); ser_bump_locked(t->serial); pthread_mutex_unlock(&g_smu);   // view caches of this serial look again (dead-serial follow)
+    pthread_mutex_lock(&g_smu); totk_serial_add(&g_dead_serial, t->serial); ser_bump_locked(t->serial); pthread_mutex_unlock(&g_smu);   // view caches of this serial look again (dead-serial follow)
     treg_drop_serial(t->serial);
 }
 /* TOTK (2026-10-17): not yet. A finalized serial must stay remembered while a texture-pool slot still names it: tex_by_id
@@ -4208,7 +4260,7 @@ static void attach(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const v
    target with the presented texture's aspect ratio before a pass into a presented texture: 1920x1080 docked, 1280x720 in
    handheld mode, where the final pass scales it to the 1920x1080 swapchain), notes the G-buffer depth (three or more
    colour targets and a D32F depth of their size) and, once the scene is copied, adds the UI attachment to canvas passes. */
-static void mfx_pass_setup(MTL4RenderPassDescriptor *pd) {
+static void canvas_learn(MTL4RenderPassDescriptor *pd) {
     const tex_t *t0 = R.rt.n > 0 ? R.rt.color[0] : NULL;
     id<MTLTexture> c0 = t0 ? pd.colorAttachments[0].texture : nil;
     if (t0 && c0 && g_mfx.swap_w) {
@@ -4219,6 +4271,11 @@ static void mfx_pass_setup(MTL4RenderPassDescriptor *pd) {
                    (pf_is_float(c0.pixelFormat) || c0.pixelFormat == MTLPixelFormatRGB10A2Unorm) && !pd.depthAttachment.texture)   // BOTW composes in RGB10A2
             g_mfx.last_c0 = t0->serial;
     }
+}
+static void mfx_pass_setup(MTL4RenderPassDescriptor *pd) {
+    canvas_learn(pd);
+    const tex_t *t0 = R.rt.n > 0 ? R.rt.color[0] : NULL;
+    id<MTLTexture> c0 = t0 ? pd.colorAttachments[0].texture : nil;
     id<MTLTexture> dt = pd.depthAttachment.texture;
     if (!g_mfx.depth_done && dt && c0 && dt.pixelFormat == MTLPixelFormatDepth32Float && dt.width == c0.width && dt.height == c0.height && dt.width >= 320) {
         int nc = 0; for (int i = 0; i < R.rt.n && i < 8; i++) nc += pd.colorAttachments[i].texture != nil;
@@ -4239,6 +4296,38 @@ static int mfx_ui_vs(const char *key) {
                                      "eaf96f5d", "e73cda77", "23079d53", "a983fef9", "92b09e2c"};   // the last five: BOTW 1.9.0 (Ui2d)
     for (size_t i = 0; i < sizeof ui / sizeof *ui; i++) if (!strncmp(key, ui[i], 8)) return 1;
     return 0;
+}
+/* Key 4 / TOTK_ASPECT (runtime/aspect_patch.h): the camera sees a wider view squeezed into the 16:9 canvas and the
+   present stretches the canvas over the window, so the UI drawn into the canvas would come out stretched as well. Its
+   draws are squeezed back about the canvas centre instead, so the HUD keeps its shape in the middle 16:9 of the window.
+   A UI draw: into the canvas, from the first draw with a UI vertex shader on (as TOTK_MFX takes it), a quad of 6
+   indices with one of the UI vertex shaders (uw_ui_vs). Everything else stays: the inventory composes its 3D scene
+   (full-screen triangles, shader 0ac9a549 and its post passes) after UI draws, and its opaque quad 7d591779 belongs to
+   that scene (squeezed, Link turns into a black silhouette). The canvas is learned as for TOTK_MFX (canvas_learn,
+   uw_note_present); g_uw_ui: this frame's UI has begun. */
+extern float runtime_aspect_now(void) __attribute__((weak_import));
+static int g_uw_ui;
+_Atomic long g_uw_log;   // diagnostic "flag uw_log <frames>": log the canvas draws of that many frames
+_Atomic long g_draw_log;   // diagnostic "flag draw_log <frames>": log every draw and dispatch of that many frames (same [uw] lines)
+static double uw_ratio(void) { float a = runtime_aspect_now ? runtime_aspect_now() : 0; return a > 0 ? a : 0; }
+static void uw_note_present(const tex_t *t) {
+    int known = 0; for (int i = 0; i < g_mfx.nswap; i++) known |= g_mfx.swap[i] == t->serial;
+    if (!known) g_mfx.swap[g_mfx.nswap < 4 ? g_mfx.nswap++ : (int)(t->serial % 4)] = t->serial;
+    g_mfx.swap_w = t->d.width; g_mfx.swap_h = t->d.height;
+}
+static int uw_on_canvas(void) { return g_mfx.canvas && R.rt.n > 0 && R.rt.color[0] && R.rt.color[0]->serial == g_mfx.canvas; }
+/* The horizontal squeeze for this draw: the wide ratio over the canvas's, or 1 (not UI, or 16:9). */
+/* The TOTK_MFX UI vertex shaders and four more that draw UI quads (inventory tab labels, map icons). */
+static int uw_ui_vs(const char *vs) {
+    static const char *const more[] = {"1a40e5f5", "2117f58b", "8d4e36d0", "1469983f"};
+    if (mfx_ui_vs(vs)) return 1;
+    for (size_t i = 0; i < sizeof more / sizeof *more; i++) if (!strncmp(vs, more[i], 8)) return 1;
+    return 0;
+}
+static double uw_ui_squeeze(const char *vs, const p_draw *dw, const p_draw_idx *di, NSUInteger tw, NSUInteger th) {
+    if (!g_uw_ui || !vs || !uw_ui_vs(vs) || (dw ? dw->count : di ? di->count : 0) != 6 || !uw_on_canvas() || !tw || !th) return 1;
+    double f = uw_ratio() * th / tw;
+    return f > 1.001 ? f : 1;
 }
 /* TOTK_MFX: the scene is complete: end the pass (the draw that follows opens it again, loading the canvas, with the UI
    attachment) and copy the canvas into this frame's scene texture. */
@@ -4460,6 +4549,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
       void ts_note(id pd, NSUInteger nc); ts_note(pd, (NSUInteger)R.rt.n); }
     ser_gate();
     if (mfx_enabled()) mfx_pass_setup(pd);   // TOTK: MetalFX scene / UI attachments, G-buffer depth
+    else if (uw_ratio()) canvas_learn(pd);   // key 4: the canvas the UI is squeezed in
     g_enc = enc_r_begin(pd);
     args_dirty_all();
     g_stat_pass++;
@@ -4559,7 +4649,7 @@ static void shmap_load(void) {
     tex_slot_cache tex_slots;
     id<MTLBuffer> ab_buf; uint64_t ab_gpu; size_t ab_off; uint64_t ab_pass;   // ab_pass：编这块参数的渲染通道序号——只在同一通道内复用（跨通道 / 跨提交的块所在 arena 可能已回收重写） | ab_pass: serial of the render pass that encoded this argument block - reused only within the same pass (the arena holding a block from another pass / another submission may already have been reclaimed and rewritten)
     id<MTLLibrary> bflib; int bflib_tried; NSMutableDictionary<NSString *, id<MTLFunction>> *bffn; id<MTLFunction> no_depth_fn;
-    NSString *src, *src_path; NSDictionary<NSNumber *, NSString *> *io; NSMutableDictionary<NSString *, id<MTLFunction>> *vpatch; id<MTLFunction> mfx_fn[8]; uint8_t mfx_tried[8]; } @end   // TOTK: MSL source, user varyings (locn -> type), patched vertex functions   // bflib：可读 tile 版本 <键>_bf（合并 B 第 2 步） | bflib: readable-tile version <key>_bf (merge B step 2)
+    NSString *src, *src_path; NSDictionary<NSNumber *, NSString *> *io; NSMutableDictionary<NSString *, id<MTLFunction>> *vpatch; id<MTLFunction> mfx_fn[8]; uint8_t mfx_tried[8]; NSMutableDictionary<NSString *, id<MTLFunction>> *bpatch; int border_seen; } @end   // TOTK: MSL source, user varyings (locn -> type), patched vertex functions   // bflib：可读 tile 版本 <键>_bf（合并 B 第 2 步） | bflib: readable-tile version <key>_bf (merge B step 2)
 @implementation NvShader @end
 /* TOTK: a shader's MSL source is needed only to build derived functions (varying patches, layered vertex, depth-less and
    MetalFX UI fragment variants). The Mac keeps it; iOS keeps only the path and reads it when needed (thousands of sources
@@ -4757,19 +4847,47 @@ static id<MTLLibrary> lib_from_file(NSString *path, NSError **err) {
         if (k == 1 || k % 100 == 0 || dt >= 300000) MLOG("着色器现编：第 %d 个 %.0f ms，累计 %.1f 秒", k, dt / 1e3, tot / 1e6);
         return l; }
 #endif
+#if TARGET_OS_IPHONE
+    // iOS：映射也占一个 vnode，而整机 vnode 表只有 11400 项（iPad A16，2026-10-18）；全量预热留着约 8800 个库时表满，系统按 vnode-limit 杀掉游戏。
+    // 这里复制进内存后立刻解除映射（全部库约 110 MB）。
+    // iOS: a mapping also holds a vnode, and the whole device has 11,400 (iPad A16, 2026-10-18); with the full warm-up keeping about
+    // 8,800 libraries the table filled and the system killed the game (jetsam reason vnode-limit). Copy and unmap at once (about 110 MB for all).
+    void *copy = malloc(len);
+    if (copy) { memcpy(copy, m, len); munmap(m, len);
+                return [g_dev newLibraryWithData:dispatch_data_create(copy, len, NULL, DISPATCH_DATA_DESTRUCTOR_FREE) error:err]; }
+#endif
     dispatch_data_t d = dispatch_data_create(m, len, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ munmap(m, len); });
     return [g_dev newLibraryWithData:d error:err];
 }
 /* TOTK: the translated Switch shaders rely on exactly rounded IEEE float arithmetic (integer-division idioms built from
    float bit patterns, invariant positions, depth compares); Metal's default fast math breaks them. */
 static MTLCompileOptions *totk_precise_opts(void) {
-    static MTLCompileOptions *o; if (o) return o;
-    o = [MTLCompileOptions new];
-    if (@available(macOS 15.0, *)) o.mathMode = MTLMathModeSafe; else o.fastMathEnabled = NO;
-    /* TOTK_FAST_MATH=1 (measurement only): fast math for every translated shader. Known to break the tile-light vertex
-       shader's integer-division idiom, so pictures from such runs are not evidence of correctness. */
-    if (getenv("TOTK_FAST_MATH") && atoi(getenv("TOTK_FAST_MATH"))) { if (@available(macOS 15.0, *)) o.mathMode = MTLMathModeFast; else o.fastMathEnabled = YES; MLOG("【实验】TOTK_FAST_MATH=1：着色器用快速数学"); }
+    /* Made once and published only when complete: the warm-up compiles on several threads (2026-10-18), and a thread must
+       never get the options before mathMode is set (that would compile with fast math). */
+    static MTLCompileOptions *o; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        MTLCompileOptions *x = [MTLCompileOptions new];
+        if (@available(macOS 15.0, *)) x.mathMode = MTLMathModeSafe; else x.fastMathEnabled = NO;
+        /* TOTK_FAST_MATH=1 (measurement only): fast math for every translated shader. Known to break the tile-light vertex
+           shader's integer-division idiom, so pictures from such runs are not evidence of correctness. */
+        if (getenv("TOTK_FAST_MATH") && atoi(getenv("TOTK_FAST_MATH"))) { if (@available(macOS 15.0, *)) x.mathMode = MTLMathModeFast; else x.fastMathEnabled = YES; MLOG("【实验】TOTK_FAST_MATH=1：着色器用快速数学"); }
+        o = x;
+    });
     return o;
+}
+/* Compile translated MSL with the precise options. The system compiler service (MTLCompilerService) can be stopped under
+   memory pressure in the middle of a compile (iPad, 2026-10-18: "Compilation failed due to an interrupted connection:
+   XPC_ERROR_CONNECTION_INTERRUPTED" while the shader warm-up was running); it restarts on the next request, so such a
+   failure is retried instead of being taken as a broken shader. */
+static id<MTLLibrary> totk_msl_library(NSString *src, NSError **err) {
+    NSError *e = nil;
+    for (int attempt = 1;; attempt++) {
+        id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:totk_precise_opts() error:&e];
+        BOOL interrupted = !lib && [e.localizedDescription containsString:@"XPC_ERROR_CONNECTION_INTERRUPTED"];
+        if (lib || !interrupted || attempt == 4) { if (err) *err = e; return lib; }
+        MLOG("【红】着色器编译服务连接中断（第 %d 次），%d ms 后重试", attempt, attempt * 100);
+        usleep((useconds_t)attempt * 100000);
+    }
 }
 /* TOTK (2026-10-15): which words of the NVN driver constant segments c0 / c2 a translated shader reads, scanned from its MSL
    at load (spirv-cross names them <stage>p_c0 / <stage>p_c2: vp_, fp_, cp_). The translation-time scan
@@ -4837,12 +4955,13 @@ static int drv_scan(NvShader *o, NSString *src) {   // src: the full MSL (iOS do
     if (nbad) MLOG("【红】着色器 %s（阶段 %d）读驱动段的这些位置回放层不填，读到 0：%s", o->key, o->stage, bad);
     return nunfill;
 }
-static uint64_t g_rt_prebuilt, g_rt_compiled;   // TOTK: translated variants loaded precompiled / compiled from MSL here
+static _Atomic uint64_t g_rt_prebuilt, g_rt_compiled;   // TOTK: translated variants loaded precompiled (iOS) / compiled from MSL here (atomic: the warm-up loads on several threads)
 #if !TARGET_OS_IPHONE
 /* TOTK: the startup shaders compiled when the app was built (build_app.py step_shader_libs), named by the SHA-256 of their
-   MSL, so only an exact match is used. Metal's own cache of libraries compiled here starts over when the app is moved or
-   rebuilt (measured: a full 4.5-minute warm-up again); these files move with the app. */
+   MSL, so only an exact match is used. Metal's own cache of libraries compiled here does not follow the app to a folder
+   whose path has another length (measured: a full 4.5-minute warm-up again); these files move with the app. */
 static NSString *shader_lib_prebuilt_path(NSData *src) {
+    if (getenv("TOTK_FAST_MATH") && atoi(getenv("TOTK_FAST_MATH"))) return nil;   // built with safe math (totk_precise_opts)
     static NSString *dir; static dispatch_once_t once; dispatch_once(&once, ^{ dir = exe_rel("shader-libs"); });
     unsigned char md[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(src.bytes, (CC_LONG)src.length, md);
     char hex[2 * sizeof md + 1]; for (size_t i = 0; i < sizeof md; i++) snprintf(hex + 2 * i, 3, "%02x", md[i]);
@@ -4867,16 +4986,17 @@ static NvShader *shader_load(NSString *pc, int stage) {
 #if TARGET_OS_IPHONE
         // iOS: the variant precompiled on the Mac (ios/tools/build_metallibs.sh, same options) if it came in shaders.pack
         NSString *rt_lib = [NSString stringWithFormat:@"%@/%@.metallib", totk_rt_dir(), pc];
-        if ([NSFileManager.defaultManager fileExistsAtPath:rt_lib]) { lib = lib_from_file(rt_lib, &e); if (!lib) MLOG("【红】预编译着色器库加载失败 %s：%s（改为现编）", pc.UTF8String, e.localizedDescription.UTF8String); else g_rt_prebuilt++; }
+        if ([NSFileManager.defaultManager fileExistsAtPath:rt_lib]) { lib = lib_from_file(rt_lib, &e); if (!lib) MLOG("【红】预编译着色器库加载失败 %s：%s（改为现编）", pc.UTF8String, e.localizedDescription.UTF8String); else atomic_fetch_add(&g_rt_prebuilt, 1); }
 #endif
         if (!lib) { NSData *raw = [NSData dataWithContentsOfFile:rt_src options:0 error:&e];
 #if !TARGET_OS_IPHONE
-                    if (raw && (lib = shader_lib_prebuilt(raw))) g_rt_prebuilt++;
+                    if (raw && (lib = shader_lib_prebuilt(raw))) atomic_fetch_add(&g_rt_prebuilt, 1);
 #endif
                     NSString *src = raw && !lib ? [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding] : nil;
-                    if (src) { lib = [g_dev newLibraryWithSource:src options:totk_precise_opts() error:&e]; g_rt_compiled++; } }
+                    if (src) { lib = totk_msl_library(src, &e); atomic_fetch_add(&g_rt_compiled, 1); } }
     } else lib = lib_from_file(lp, &e);
-    if (rt && (g_rt_prebuilt + g_rt_compiled) % 200 == 1) MLOG("着色器库：预编译加载 %llu 个，现编 %llu 个", (unsigned long long)g_rt_prebuilt, (unsigned long long)g_rt_compiled);
+    if (rt) { uint64_t pre = atomic_load(&g_rt_prebuilt), com = atomic_load(&g_rt_compiled);
+              if ((pre + com) % 200 == 1) MLOG("着色器库：预编译加载 %llu 个，现编 %llu 个", (unsigned long long)pre, (unsigned long long)com); }
     NSData *jd = [NSData dataWithContentsOfFile:[NSString stringWithFormat:@"%@/%@.json", rt ? totk_rt_dir() : g_msl_dir, pc]];
     NSDictionary *j = jd ? [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil] : nil;
     if (!lib || !j) { MLOG("【红】加载着色器失败 %s：%s", pc.UTF8String, e ? e.localizedDescription.UTF8String : "无反射 json"); return nil; }
@@ -5047,6 +5167,20 @@ void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) {
     if (id_ < (1 << 20)) atomic_store_explicit(&g_tser[id_], t ? t->serial : 0, memory_order_release);
     registry_unlock();
 }
+/* TOTK: Metal has three border colours (transparent black, opaque black, opaque white). A sampler that clamps to any
+   other colour is emulated in the shader (fs_fn_border). The game's grass interaction map (two 256x256 targets updated
+   from each other every frame, scrolled with the player) clamps to (0.5, 0.5, 0.5, 0.5), its "untouched" value: with
+   transparent black every area entering the map read as grass bent all the way, so grass lay flat away from the player,
+   stood up where Link walked and showed no cut (#49). */
+static int samp_border_custom(const samp_par *p) {
+    if (!(p->ws == 4 || p->ws == 5 || p->wt == 4 || p->wt == 5 || p->wr == 4 || p->wr == 5)) return 0;
+    const float *b = p->border;
+    int grey = b[0] == b[1] && b[1] == b[2];
+    if (grey && b[0] == 0 && (b[3] == 0 || b[3] == 1)) return 0;   // transparent / opaque black
+    if (grey && b[0] == 1 && b[3] == 1) return 0;                   // opaque white
+    return 1;
+}
+static _Atomic int g_border_custom_any;   // set once such a sampler is registered: border_key runs only then
 void mtl_reg_samp(int sid, const samp_par *sp) {
     int id_ = sid; if (id_ < 0) return;
     registry_lock();
@@ -5055,6 +5189,7 @@ void mtl_reg_samp(int sid, const samp_par *sp) {
     if (g_sview[id_]) { CFRelease(g_sview[id_]); g_sview[id_] = NULL; g_srid[id_] = 0; }
     g_reg_gen++;
     g_sreg[id_] = *sp; g_sreg_ok[id_] = 1;
+    if (samp_border_custom(sp)) atomic_store(&g_border_custom_any, 1);
     registry_unlock();
 }
 /* Texture-pool slots whose cached view still holds a texture of a finalized serial (diagnostic for the readout line). */
@@ -5344,6 +5479,11 @@ static id<MTLSamplerState> samp_by_id(int sid) {   // 调用方持 g_rmu | Calle
     d.minFilter = (p.minf == 1 || p.minf == 3 || p.minf == 5) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
     d.mipFilter = p.minf <= 1 ? MTLSamplerMipFilterNotMipmapped : (p.minf == 2 || p.minf == 3) ? MTLSamplerMipFilterNearest : MTLSamplerMipFilterLinear;
     d.sAddressMode = wrapm(p.ws); d.tAddressMode = wrapm(p.wt); d.rAddressMode = wrapm(p.wr);
+    if (samp_border_custom(&p)) {   // the shader returns the border colour outside the texture (fs_fn_border); inside it, edge texels must not blend with a wrong border
+        if (d.sAddressMode == MTLSamplerAddressModeClampToBorderColor) d.sAddressMode = MTLSamplerAddressModeClampToEdge;
+        if (d.tAddressMode == MTLSamplerAddressModeClampToBorderColor) d.tAddressMode = MTLSamplerAddressModeClampToEdge;
+        if (d.rAddressMode == MTLSamplerAddressModeClampToBorderColor) d.rAddressMode = MTLSamplerAddressModeClampToEdge;
+    }
     d.lodMinClamp = p.lod_min < 0 ? 0 : p.lod_min; d.lodMaxClamp = p.lod_max;
     d.maxAnisotropy = p.aniso < 1 ? 1 : p.aniso > 16 ? 16 : (NSUInteger)p.aniso;
     if (p.cmp_mode) d.compareFunction = (MTLCompareFunction)(p.cmp_func - 1);
@@ -5537,6 +5677,40 @@ static int prog_fit(NvProg *pr) {
     }
     return changed;
 }
+// TOTK_PROBE_NEGATIVE for the prediction checks of probe-gfx (24-27: each breaks one rule below; the probe must fail).
+static int pred_negative(void) { static int neg = -1; if (neg < 0) { const char *e = getenv("TOTK_PROBE_NEGATIVE"); neg = e ? atoi(e) : 0; } return neg; }
+// Prediction must not translate/compile, or mutate a program's active binding.
+// Only the exact already-resolved variant is safe to predict. Unknown variants
+// are left for the authoritative draw path, without changing active bindings.
+// A program with a stage not translated yet (pr->missing, iOS) is skipped too: its draws are skipped (draw_inner), and
+// its fragment stage can be absent, which would predict a pipeline without a fragment function.
+// Negative 24 takes the active variant whatever the state; 26 ignores untranslated stages.
+static int prog_prediction_stages(const prog_t *p, NvShader **vs, NvShader **fs) {
+    NvProg *pr = p && p->serial ? (__bridge NvProg *)serial_ptr(p->serial) : nil;
+    if (!pr || (pr->missing && pred_negative() != 26)) return 0;
+    NvShader *stages[2] = {nil, nil};
+    for (int st = 0; st < 2; st++) {
+        if (!pr->sh[st]) { if (!st) return 0; continue; }
+        uint64_t sig = stage_sig(st);
+        stages[st] = sig == pr->sig[st] || pred_negative() == 24 ? pr->sh[st] : pr->alt[st][@(sig)];
+        if (!stages[st]) return 0;
+    }
+    *vs = stages[0]; *fs = stages[1]; return 1;
+}
+// Attach modes pso_predict_rest guesses for one draw: v = 0 the pass's own depth / stencil, 1 neither, 2 stencil only,
+// 3 depth only (ds_scan drops the planes no draw uses, which is only known at replay).
+static const uint8_t PRED_DEPTH[4] = {1, 0, 0, 1}, PRED_STENCIL[4] = {1, 0, 1, 0};
+// A fragment function that exports depth makes ds_scan attach the pass's depth buffer, so a guess without it is never
+// used -- and pso_desc would compile that variant's library (fs_fn_without_depth) on the submit thread for nothing.
+// Negative 27 guesses it anyway.
+static int pred_guess_wanted(int v, uint32_t dfull, uint32_t sfull, __unsafe_unretained NvShader *fs) {
+    uint32_t d = PRED_DEPTH[v] ? dfull : 0, s = PRED_STENCIL[v] ? sfull : 0;
+    if (v && d == dfull && s == sfull) return 0;   // same as the pass's own
+    if (v == 2 && !sfull) return 0;
+    if (v == 3 && (!dfull || !sfull)) return 0;
+    if (dfull && !d && fs && fs->writes_depth && pred_negative() != 27) return 0;
+    return 1;
+}
 // Compute thread group size lives in the control section; not located yet, so compute shaders stop with this message.
 /* Compute thread group size: control+0x748/0x74c/0x750. Evidence (12 TOTK kernels): the triple exists only in compute
    control sections; every kernel with 1,1,1 reads no thread-in-group id, and every kernel that reads it carries a
@@ -5629,16 +5803,90 @@ static int vs_layerable(NvShader *vs) {
         && [vsrc0 rangeOfString:@"main0_out out = {};"].location != NSNotFound && [vsrc0 rangeOfString:@"render_target_array_index"].location == NSNotFound ? 1 : -1;
     return vs->lay_ok > 0;
 }
-static id<MTLFunction> vs_fn_for(NvShader *vs, NvShader *fs, int layered) {
+static NSString *fs_src_without_depth(NvShader *fs);
+/* TOTK: samplers that clamp to a border colour Metal does not have (samp_border_custom) are emulated in the shader: the
+   stage's sample calls on them return that colour when the coordinate is outside [0, 1]. border_key lists the stage's
+   bound samplers that need it (argument id and colour; nil when none), border_src rewrites the MSL. */
+static NSString *border_key(NvShader *sh, int stage, float colours[][4], int aids[], int *n) {
+    *n = 0;
+    if (!atomic_load_explicit(&g_border_custom_any, memory_order_relaxed)) return nil;
+    NSMutableString *key = nil;
+    registry_lock();
+    for (int i = 0; i < sh->rf.nb && *n < 8; i++) {
+        const nvn_rbind *b = &sh->rf.b[i];
+        if ((b->kind != NVN_RB_SAMP && b->kind != NVN_RB_SAMPT) || b->reg >= 128) continue;
+        int sid = (int)((b->kind == NVN_RB_SAMPT ? S.tex[stage][b->reg] : S.samp[stage][b->reg]) >> 20);
+        if (sid <= 0 || sid >= g_nsreg || !g_sreg_ok[sid] || !samp_border_custom(&g_sreg[sid])) continue;
+        memcpy(colours[*n], g_sreg[sid].border, sizeof colours[*n]); aids[*n] = b->aid;
+        if (!key) key = [NSMutableString string];
+        [key appendFormat:@"%d:%a,%a,%a,%a;", b->aid, colours[*n][0], colours[*n][1], colours[*n][2], colours[*n][3]];
+        ++*n;
+    }
+    registry_unlock();
+    if (key) sh->border_seen = 1;
+    return key;
+}
+static NSString *border_src(NvShader *sh, NSString *src0, float colours[][4], const int aids[], int n) {
+    NSString *src = src0; int patched = 0;
+    for (int i = 0; i < n; i++) {   // SPIRV-Cross: "sampler <name> [[id(<aid>)]]" in the argument struct, used as tex.sample(spvDescriptorSet0.<name>, coord, ...)
+        NSString *decl = [NSString stringWithFormat:@"sampler\\s+(\\w+)\\s*\\[\\[id\\(%d\\)\\]\\]", aids[i]];
+        NSTextCheckingResult *m = [[NSRegularExpression regularExpressionWithPattern:decl options:0 error:nil] firstMatchInString:src options:0 range:NSMakeRange(0, src.length)];
+        if (!m) continue;
+        NSString *name = [src substringWithRange:[m rangeAtIndex:1]];
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:[NSString stringWithFormat:@"([\\w.]+)\\.sample\\((\\s*spvDescriptorSet0\\.%@\\s*,)", name] options:0 error:nil];
+        patched += (int)[re numberOfMatchesInString:src options:0 range:NSMakeRange(0, src.length)];
+        src = [re stringByReplacingMatchesInString:src options:0 range:NSMakeRange(0, src.length)
+                                      withTemplate:[NSString stringWithFormat:@"totk_border_sample(float4(%a, %a, %a, %a), $1,$2", colours[i][0], colours[i][1], colours[i][2], colours[i][3]]];
+    }
+    if (!patched) { static int warned; if (!warned++) MLOG("[totk] shader %s: a sampler clamps to a border colour Metal lacks, but no sample call to emulate it was found", sh->key); return nil; }
+    NSString *helper =   // 2D, 2D array and 3D textures test the normalized coordinate; other kinds (cube, depth) sample as before
+        @"template<typename T, typename... A> static inline vec<T, 4> totk_border_sample(float4 border, texture2d<T> t, sampler s, float2 uv, A... a)\n"
+        @"{ return any(uv < 0.0) || any(uv > 1.0) ? vec<T, 4>(border) : t.sample(s, uv, a...); }\n"
+        @"template<typename T, typename... A> static inline vec<T, 4> totk_border_sample(float4 border, texture2d_array<T> t, sampler s, float2 uv, A... a)\n"
+        @"{ return any(uv < 0.0) || any(uv > 1.0) ? vec<T, 4>(border) : t.sample(s, uv, a...); }\n"
+        @"template<typename T, typename... A> static inline vec<T, 4> totk_border_sample(float4 border, texture3d<T> t, sampler s, float3 uv, A... a)\n"
+        @"{ return any(uv < 0.0) || any(uv > 1.0) ? vec<T, 4>(border) : t.sample(s, uv, a...); }\n"
+        @"template<typename Tex, typename C, typename... A> static inline auto totk_border_sample(float4 border, Tex t, sampler s, C uv, A... a) -> decltype(t.sample(s, uv, a...))\n"
+        @"{ return t.sample(s, uv, a...); }\n";
+    NSRange r = [src rangeOfString:@"using namespace metal;\n"];
+    if (r.location == NSNotFound) MDIE("shader %s: no 'using namespace metal;' for the border colour helper", sh->key);
+    static int logged; if (logged++ < 16) MLOG("[totk] shader %s: sampler border colour %g %g %g %g emulated in the shader (%d samples; Metal has no such border colour)",
+                                              sh->key, colours[0][0], colours[0][1], colours[0][2], colours[0][3], patched);
+    return [src stringByReplacingCharactersInRange:NSMakeRange(NSMaxRange(r), 0) withString:helper];
+}
+/* The fragment function for the draw's samplers (border_key), nil when none needs the emulation. */
+static id<MTLFunction> fs_fn_border(NvShader *fs, int nodepth) {
+    if (!fs || !sh_has_src(fs)) return nil;
+    float colours[8][4]; int aids[8], n;
+    NSString *key = border_key(fs, 1, colours, aids, &n);
+    if (!key) return nil;
+    if (nodepth && fs->writes_depth) key = [@"nodepth;" stringByAppendingString:key];
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT; os_unfair_lock_lock(&lock);
+    id<MTLFunction> fn = fs->bpatch[key];
+    if (!fn) {
+        NSString *src = border_src(fs, nodepth && fs->writes_depth ? fs_src_without_depth(fs) : sh_src(fs), colours, aids, n);
+        if (!src) { os_unfair_lock_unlock(&lock); return nil; }
+        NSError *err = nil; id<MTLLibrary> lib = totk_msl_library(src, &err);
+        fn = lib ? [lib newFunctionWithName:fs->fn.name] : nil;
+        if (!fn) MDIE("fragment shader %s with emulated sampler border colour: %s", fs->key, err.localizedDescription.UTF8String);
+        if (!fs->bpatch) fs->bpatch = [NSMutableDictionary dictionary];
+        fs->bpatch[key] = fn;
+    }
+    os_unfair_lock_unlock(&lock);
+    return fn;
+}
+static id<MTLFunction> vs_fn_for(NvShader *vs, NvShader *fs, int layered, int border) {
     static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
     if (layered && !vs_layerable(vs)) MDIE("vertex shader %s cannot write the render target array index", vs->key);
-    if (!sh_has_src(vs) || (!layered && (!fs || !sh_has_src(fs)))) return vs->fn;
+    float bc[8][4]; int ba[8], bn = 0;   // TOTK: vertex-stage samplers with a border colour Metal lacks (PSO_VBORDER)
+    NSString *bkey = border && sh_has_src(vs) ? border_key(vs, 0, bc, ba, &bn) : nil;
+    if (!sh_has_src(vs) || (!layered && !bkey && (!fs || !sh_has_src(fs)))) return vs->fn;
     os_unfair_lock_lock(&lk);
     NSDictionary *in = fs && sh_has_src(fs) ? msl_varyings(fs) : nil, *out = in ? msl_varyings(vs) : nil;
     NSMutableArray *miss = [NSMutableArray array];
     for (NSNumber *l in [in.allKeys sortedArrayUsingSelector:@selector(compare:)]) if (!out[l]) [miss addObject:l];
-    if (!miss.count && !layered) { os_unfair_lock_unlock(&lk); return vs->fn; }
-    NSString *key = [(layered ? @"layer;" : @"") stringByAppendingString:[miss componentsJoinedByString:@","]];
+    if (!miss.count && !layered && !bkey) { os_unfair_lock_unlock(&lk); return vs->fn; }
+    NSString *key = [NSString stringWithFormat:@"%@%@%@", layered ? @"layer;" : @"", bkey ? [NSString stringWithFormat:@"border:%@", bkey] : @"", [miss componentsJoinedByString:@","]];
     id<MTLFunction> f = vs->vpatch[key];
     if (!f) {
         NSMutableString *add = [NSMutableString string];
@@ -5646,6 +5894,7 @@ static id<MTLFunction> vs_fn_for(NvShader *vs, NvShader *fs, int layered) {
         if (layered) [add appendString:@"    uint totk_layer [[render_target_array_index]];\n"];
         NSString *head = @"struct main0_out\n{\n";
         NSString *vsrc0 = sh_src(vs);
+        if (bkey) { NSString *b = border_src(vs, vsrc0, bc, ba, bn); if (b) vsrc0 = b; }
         NSRange r = [vsrc0 rangeOfString:head];
         if (r.location == NSNotFound) MDIE("vertex shader %s: no main0_out to extend", vs->key);
         NSString *src = [vsrc0 stringByReplacingCharactersInRange:r withString:[head stringByAppendingString:add]];
@@ -5662,13 +5911,13 @@ static id<MTLFunction> vs_fn_for(NvShader *vs, NvShader *fs, int layered) {
             src = [src stringByReplacingCharactersInRange:[src rangeOfString:entry] withString:[entry stringByAppendingFormat:@"constant uint& totk_layer_in [[buffer(%d)]], ", LAY_BUF_INDEX]];
             src = [src stringByReplacingOccurrencesOfString:@"return out;" withString:@"{ out.totk_layer = totk_layer_in; return out; }"];
         }
-        NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:totk_precise_opts() error:&e];
+        NSError *e = nil; id<MTLLibrary> lib = totk_msl_library(src, &e);
         f = lib ? [lib newFunctionWithName:vs->fn.name] : nil;
         if (!f) MDIE("vertex shader %s (variant %s): %s", vs->key, key.UTF8String, e.localizedDescription.UTF8String);
         if (!vs->vpatch) vs->vpatch = [NSMutableDictionary dictionary];
         vs->vpatch[key] = f;
         static int once, lonce;
-        if (miss.count && !once++) MLOG("[totk] fragment shader reads varyings the vertex shader leaves unwritten (first: %s locn %s): added as zero outputs", vs->key, [miss componentsJoinedByString:@","].UTF8String);
+        if (miss.count && once++ < 64) MLOG("[totk] fragment shader %s reads varyings the vertex shader %s leaves unwritten (locn %s): added as zero outputs", fs ? fs->key : "-", vs->key, [miss componentsJoinedByString:@","].UTF8String);
         if (layered && !lonce++) MLOG("[totk] layered pass: vertex shader %s writes the render target array index", vs->key);
     }
     os_unfair_lock_unlock(&lk);
@@ -5695,7 +5944,7 @@ static id<MTLFunction> fs_fn_without_depth(NvShader *fs) {
     static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT; os_unfair_lock_lock(&lock);
     if (!fs->no_depth_fn) {
         NSString *src = fs_src_without_depth(fs);
-        NSError *err = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:totk_precise_opts() error:&err];
+        NSError *err = nil; id<MTLLibrary> lib = totk_msl_library(src, &err);
         fs->no_depth_fn = lib ? [lib newFunctionWithName:fs->fn.name] : nil;
         if (!fs->no_depth_fn) MDIE("fragment shader %s without depth export: %s", fs->key, err.localizedDescription.UTF8String);
         MLOG("[totk] fragment depth export omitted for a color-only pass: %s", fs->key);
@@ -5724,7 +5973,7 @@ static id<MTLFunction> fs_fn_mfx(NvShader *fs, int role, int nodepth) {
         if (e && [src rangeOfString:head].location != NSNotFound && [src rangeOfString:@"[[color(7)]]"].location == NSNotFound) {
             src = [src stringByReplacingCharactersInRange:[src rangeOfString:head] withString:[head stringByAppendingString:@"    float4 totk_mfx_copy [[color(7)]];\n"]];
             src = [src stringByReplacingOccurrencesOfString:@"return out;" withString:[NSString stringWithFormat:@"{ out.totk_mfx_copy = %@; return out; }", e]];
-            NSError *err = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:totk_precise_opts() error:&err];
+            NSError *err = nil; id<MTLLibrary> lib = totk_msl_library(src, &err);
             fs->mfx_fn[idx] = lib ? [lib newFunctionWithName:fs->fn.name] : nil;
             if (!fs->mfx_fn[idx]) MDIE("fragment shader %s, MetalFX copy (role %d): %s", fs->key, role, err.localizedDescription.UTF8String);
         } else MLOG("【红】[mfx] fragment shader %s: colour 0 (%s) cannot be copied to the UI layer; this draw is left out of it", fs->key, type ? type.UTF8String : "none");
@@ -5788,7 +6037,7 @@ static id<MTLFunction> nan_trace_fn(NvShader *fs) {
         [o appendFormat:@"%@\n", l];
     }
     if (in_entry != 3) MDIE("TOTK_NAN_TRACE: could not instrument %s (state %d)", fs->key, in_entry);
-    NSError *err = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:o options:totk_precise_opts() error:&err];
+    NSError *err = nil; id<MTLLibrary> lib = totk_msl_library(o, &err);
     id<MTLFunction> fn = lib ? [lib newFunctionWithName:fs->fn.name] : nil;
     if (!fn) MDIE("TOTK_NAN_TRACE: %s does not compile: %s", fs->key, err.localizedDescription.UTF8String);
     MLOG("TOTK_NAN_TRACE: %s rebuilt with %d checked temporaries, outputs %s", fs->key, instrumented, [outs componentsJoinedByString:@","].UTF8String);
@@ -5825,7 +6074,7 @@ static void nan_trace_bind(id<MTL4RenderCommandEncoder> en) {
 }
 static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> fsfn, int merged) {
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
-    d.vertexFunction = vs_fn_for(vs, fs, (k->a2c & PSO_LAYERED) != 0); d.fragmentFunction = fsfn ? fsfn : fs ? (k->dfmt ? fs->fn : fs_fn_without_depth(fs)) : nil;
+    d.vertexFunction = vs_fn_for(vs, fs, (k->a2c & PSO_LAYERED) != 0, (k->a2c & PSO_VBORDER) != 0); d.fragmentFunction = fsfn ? fsfn : fs ? (k->dfmt ? fs->fn : fs_fn_without_depth(fs)) : nil;
     if (!fsfn && nan_trace_match(fs) && !fs->writes_depth) d.fragmentFunction = nan_trace_fn(fs);   // diagnostic TOTK_NAN_TRACE
     // 诊断 DM_NVN_HILITE=片元着色器键,…：这些绘制改用纯色片元（第 1–6 个键依次 品红 / 绿 / 青 / 黄 / 蓝 / 白），看几何落在哪里
     // Diagnostic DM_NVN_HILITE=fragment shader key,...: these draws use a solid-color fragment instead (keys 1–6 in order magenta / green / cyan / yellow / blue / white), to see where the geometry lands
@@ -5939,17 +6188,29 @@ static void pso_key_fill(pso_key *k, NvShader *vs, NvShader *fs, const uint32_t 
 // Now: on the first pipeline miss in a submission, scan ahead once along the remaining commands (replaying state only, no drawing) and kick all the normal-pass pipelines that will also miss later to the background to compile in parallel;
 // when the submit thread reaches that draw it only waits for 'the remaining time not yet compiled'. The compiled pipelines are identical to synchronously compiled ones (same descriptor). Pipeline keys of merged passes / specialized fragments depend on the planning result at replay time, are not predicted, and are compiled synchronously as before.
 #define PSO_PEND_MAX 384
-static struct { pso_key k; id<MTLRenderPipelineState> ps; int used, done; } g_pp[PSO_PEND_MAX];
+static struct { pso_key k; id<MTLRenderPipelineState> ps; uint64_t submit; int used, done; } g_pp[PSO_PEND_MAX];
 static pthread_mutex_t g_pp_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pp_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_pp_submit_mark, g_pp_kicked, g_pp_taken;   // 本次提交是否已预测过（按提交序号）；累计丢出 / 领用条数 | Whether this submission has already been predicted (by submission serial); cumulative kicked / taken counts
+// Statistics line (pso_predict_rest, every 100 scans): guesses refused because the table was full, stale guesses freed,
+// time draws waited for a background compile, scans and which budget ended them.
+static uint64_t g_pp_full, g_pp_reclaimed, g_pp_waits, g_pp_wait_ns, g_pp_scans, g_pp_scan_ns, g_pp_stop[3];
 static void pso_predict_rest(void);
 static int pso_pend_find(const pso_key *k) { for (int i = 0; i < PSO_PEND_MAX; i++) if (g_pp[i].used && !memcmp(&g_pp[i].k, k, sizeof *k)) return i; return -1; }
+// Called only with g_pp_mu held. An in-flight worker still owns its slot:
+// completion must be published before that slot can ever be reused. Negative 25 frees every slot.
+static void pso_pend_reclaim(uint64_t submit) {
+    for (int i = 0; i < PSO_PEND_MAX; i++) if (g_pp[i].used && ((g_pp[i].done && submit - g_pp[i].submit > 2) || pred_negative() == 25)) {
+        g_pp[i].ps = nil; g_pp[i].used = 0; g_pp_reclaimed++;
+    }
+}
 static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // 提交线程调：没在缓存、没在表里才丢 | Called by the submit thread: kick only if it is neither in the cache nor in the table
     if (hm_get_id(&g_pso, k)) return;
     pthread_mutex_lock(&g_pp_mu);
+    pso_pend_reclaim(g_sub_serial);
     int at = pso_pend_find(k), slot = -1;
     if (at < 0) for (int i = 0; i < PSO_PEND_MAX; i++) if (!g_pp[i].used) { slot = i; break; }
-    if (at < 0 && slot >= 0) { g_pp[slot].k = *k; g_pp[slot].ps = nil; g_pp[slot].done = 0; g_pp[slot].used = 1; }
+    if (at < 0 && slot >= 0) { g_pp[slot].k = *k; g_pp[slot].ps = nil; g_pp[slot].done = 0; g_pp[slot].used = 1; g_pp[slot].submit = g_sub_serial; }
+    if (at < 0 && slot < 0) g_pp_full++;
     pthread_mutex_unlock(&g_pp_mu);
     if (at >= 0 || slot < 0) return;
     MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, nil, 0); g_pp_kicked++;
@@ -5961,7 +6222,10 @@ static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // �
 static id<MTLRenderPipelineState> pso_pend_take(const pso_key *k) {   // 提交线程调：表里有就等它编完并取走；没有返回 nil | Called by the submit thread: if it is in the table, wait for it to finish compiling and take it; otherwise return nil
     pthread_mutex_lock(&g_pp_mu);
     int at = pso_pend_find(k); id<MTLRenderPipelineState> ps = nil;
-    if (at >= 0) { while (!g_pp[at].done) pthread_cond_wait(&g_pp_cv, &g_pp_mu); ps = g_pp[at].ps; g_pp[at].ps = nil; g_pp[at].used = 0; }
+    if (at >= 0) { uint64_t t0 = bp_now(); int waited = !g_pp[at].done;
+        while (!g_pp[at].done) pthread_cond_wait(&g_pp_cv, &g_pp_mu);
+        if (waited) { g_pp_waits++; g_pp_wait_ns += bp_now() - t0; }
+        ps = g_pp[at].ps; g_pp[at].ps = nil; g_pp[at].used = 0; }
     pthread_mutex_unlock(&g_pp_mu);
     return ps;
 }
@@ -5973,6 +6237,9 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     if (g_pass.layered) k.a2c |= PSO_LAYERED;   // TOTK: layered pass (see g_lay)
     if (g_mfx.role) k.a2c |= (uint32_t)g_mfx.role << 2;   // TOTK_MFX: scene / UI copy variant (see pso_desc)
     if (g_pso_lmap) { memcpy(k.lmap, g_pso_lmap, 8); k.fsfn = (__bridge void *)g_pso_fsfn; }
+    __unsafe_unretained id<MTLFunction> bfn = !g_pso_lmap && !g_mfx.role ? fs_fn_border(fs, k.dfmt == 0) : nil;   // TOTK: sampler border colour emulation
+    if (bfn) k.fsfn = (__bridge void *)bfn;
+    { float bc[8][4]; int ba[8], bn; if (border_key(vs, 0, bc, ba, &bn)) k.a2c |= PSO_VBORDER; }
     __unsafe_unretained id<MTLRenderPipelineState> cached = (__bridge id<MTLRenderPipelineState>)hm_get_ptr(&g_pso, &k);
     if (cached) return cached;
     id<MTLRenderPipelineState> ps;
@@ -5981,12 +6248,13 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     if (ps) g_pp_taken++;
     else {
         if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; pso_predict_rest(); }   // 本次提交第一次缺：先把后面的丢出去并行编，再同步编眼前这条 | First miss in this submission: first kick the later ones out to compile in parallel, then synchronously compile the one at hand
-        MTLRenderPipelineDescriptor *d = pso_desc(&k, vs, fs, g_pso_fsfn, g_pso_lmap != NULL);
+        MTLRenderPipelineDescriptor *d = pso_desc(&k, vs, fs, bfn ? bfn : g_pso_fsfn, g_pso_lmap != NULL);
         ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
     }
     g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
     if (!ps) { static int said; if (said++ < 12) MLOG("【红】建渲染管线失败：%s（vs %s ps %s dfmt %d sfmt %d cfmt0 %d samples %d）", e.localizedDescription.UTF8String, vs->key, fs ? fs->key : "-", (int)k.dfmt, (int)k.sfmt, (int)k.cfmt[0], (int)k.samples); else if (said == 12) MLOG("【红】建渲染管线失败：后续不再逐条打印"); return nil; }
-    pso_skey sk; char shex[sizeof sk * 2 + 1]; pso_skey_from(&k, vs, fs, g_pso_lmap != NULL, g_pso_lmap ? &g_pso_fz : NULL, &sk); pso_skey_hex(&sk, shex);
+    pso_key rk = k; rk.a2c &= ~PSO_VBORDER; if (bfn) rk.fsfn = NULL;   // the warm-up list records the plain pipeline: a border variant is built from the draw's samplers
+    pso_skey sk; char shex[sizeof sk * 2 + 1]; pso_skey_from(&rk, vs, fs, g_pso_lmap != NULL, g_pso_lmap ? &g_pso_fz : NULL, &sk); pso_skey_hex(&sk, shex);
     if (survey_shader_log()) MLOG("[survey-shader] frame %llu render pipeline %s in %.2f ms", (unsigned long long)atomic_load(&g_cur_frame), shex, (bp_now() - bt) / 1e6);
     pso_record("R\t%s\n", shex);
     pso_user_record("R\t%s\n", shex);
@@ -5997,7 +6265,7 @@ static NSString *warm_key(const char *s, size_t n) {
     size_t z = strnlen(s, n);
     return [[NSString alloc] initWithBytes:s length:z encoding:NSUTF8StringEncoding];
 }
-static uint64_t g_warm_missing;   // shaders named in the warm lists that are not in the translation cache (yet)
+static _Atomic uint64_t g_warm_missing;   // shaders named in the warm lists that are not in the translation cache (yet)
 static int warm_available(NSString *key) {
     if (!key.length) return 1;
     NSFileManager *fm = NSFileManager.defaultManager;
@@ -6012,29 +6280,118 @@ static int warm_available(NSString *key) {
     }
     return have;
 }
+/* One shader of the warm-up, without the per-run dictionary (safe on several threads at once). */
+static NvShader *warm_shader_load(NSString *key, int stage) {
+    /* A warm list may name a variant this cache does not hold (collected by another session, the cache trimmed): it is
+       translated on first use like any new shader, so the warm-up skips it quietly and counts it (one line at the end)
+       instead of a red "cannot open" per pipeline that names it (2026-10-16 night: 42 such lines in one session). */
+    static NSMutableSet<NSString *> *missing; static dispatch_once_t once; dispatch_once(&once, ^{ missing = [NSMutableSet set]; });
+    @synchronized (missing) { if ([missing containsObject:key]) return nil; }
+    NSString *msl = [NSString stringWithContentsOfFile:[totk_rt_dir() stringByAppendingFormat:@"/%@.metal", key]
+                                                encoding:NSUTF8StringEncoding error:nil];
+    if (!msl && ![NSFileManager.defaultManager fileExistsAtPath:[totk_rt_dir() stringByAppendingFormat:@"/%@.metallib", key]] &&
+        ![NSFileManager.defaultManager fileExistsAtPath:[NSString stringWithFormat:@"%@/%@.metallib", g_msl_dir, key]]) {
+        @synchronized (missing) { if (![missing containsObject:key]) { [missing addObject:key]; g_warm_missing++; } }
+        return nil;
+    }
+    if (msl && ([msl containsString:@"double "] || [msl containsString:@"unsupported_GLSLstd450"])) return nil;
+    uint64_t started = bp_now();
+    NvShader *sh = shader_load(key, stage);
+    atomic_fetch_add(&g_warm_library_ns, bp_now() - started);
+    atomic_fetch_add(&g_warm_library_count, 1);
+    return sh;
+}
+/* Shaders whose warm-up load failed: tried once, not again for every row that names them. */
+static NSMutableSet<NSString *> *g_warm_failed;
+static os_unfair_lock g_warm_failed_lock = OS_UNFAIR_LOCK_INIT;
+static int warm_failed(NSString *key) {
+    os_unfair_lock_lock(&g_warm_failed_lock); int f = [g_warm_failed containsObject:key]; os_unfair_lock_unlock(&g_warm_failed_lock);
+    return f;
+}
+static void warm_fail(NSString *key) {
+    os_unfair_lock_lock(&g_warm_failed_lock);
+    if (!g_warm_failed) g_warm_failed = [NSMutableSet set];
+    [g_warm_failed addObject:key];
+    os_unfair_lock_unlock(&g_warm_failed_lock);
+}
 static NvShader *warm_shader(NSMutableDictionary<NSString *, NvShader *> *dict, NSString *key, int stage) {
     NvShader *sh = dict[key];
-    if (!sh) {
-        /* A warm list may name a variant this cache does not hold (collected by another session, the cache trimmed): it is
-           translated on first use like any new shader, so the warm-up skips it quietly and counts it (one line at the end)
-           instead of a red "cannot open" per pipeline that names it (2026-10-16 night: 42 such lines in one session). */
-        static NSMutableSet<NSString *> *missing; static dispatch_once_t once; dispatch_once(&once, ^{ missing = [NSMutableSet set]; });
-        @synchronized (missing) { if ([missing containsObject:key]) return nil; }
-        NSString *msl = [NSString stringWithContentsOfFile:[totk_rt_dir() stringByAppendingFormat:@"/%@.metal", key]
-                                                    encoding:NSUTF8StringEncoding error:nil];
-        if (!msl && ![NSFileManager.defaultManager fileExistsAtPath:[totk_rt_dir() stringByAppendingFormat:@"/%@.metallib", key]] &&
-            ![NSFileManager.defaultManager fileExistsAtPath:[NSString stringWithFormat:@"%@/%@.metallib", g_msl_dir, key]]) {
-            @synchronized (missing) { if (![missing containsObject:key]) { [missing addObject:key]; g_warm_missing++; } }
-            return nil;
-        }
-        if (msl && ([msl containsString:@"double "] || [msl containsString:@"unsupported_GLSLstd450"])) return nil;
-        uint64_t started = bp_now();
-        sh = shader_load(key, stage);
-        atomic_fetch_add(&g_warm_library_ns, bp_now() - started);
-        atomic_fetch_add(&g_warm_library_count, 1);
-        if (sh) dict[key] = sh;
-    }
+    if (sh || warm_failed(key)) return sh;
+    sh = warm_shader_load(key, stage);
+    if (sh) dict[key] = sh; else warm_fail(key);
     return sh;
+}
+/* TOTK (2026-10-18): the warm-up compiles the shader libraries of each block of rows on several threads, then builds the
+   pipelines of those rows one after another in list order, as before. A cold library takes about 48-92 ms, almost all of it
+   in the system Metal compiler (one thread: 9,268 libraries 856 s, 3,459 pipelines under 1 s), and the compiler service runs
+   requests side by side (8 threads: 188 s). That matters on a Mac whose Metal cache has never seen the prepared shaders: a
+   new Mac, after the system purged the cache, or after the app moved. (Programs without an app bundle -- the game binary is
+   one -- share one store, keyed by the source, the options and the length of the path of the folder the program runs
+   from: rebuilding the app in the same place keeps it, moving it does not. The store evicts heavily when any such program
+   compiles many new libraries, and what one compiles while another that opened it first is running is lost when that
+   one quits. build_app.py compiles the seed once at packaging time from the game binary's folder, with no other program
+   using the store: tools/warm_metal_cache.m.) Once the player is in the world (mtl_warm_wait returned) at most 2 threads go on, so the
+   rest of the warm-up does not take the game's cores. TOTK_WARM_THREADS=<n> (1 = one thread as before); default 8 on the
+   Mac (at most the core count minus 2), 1 on iOS (prebuilt libraries, nothing to compile). */
+enum { WARM_BLOCK = 512 };   // rows per block: the shaders of a block load in parallel, then its rows run in order
+static _Atomic int g_warm_in_play;
+static int warm_threads(void) {
+    static int n; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *e = getenv("TOTK_WARM_THREADS");
+#if TARGET_OS_IPHONE
+        int d = 1;
+#else
+        int d = (int)NSProcessInfo.processInfo.activeProcessorCount - 2; if (d > 8) d = 8; if (d < 1) d = 1;
+#endif
+        n = e && *e ? atoi(e) : d; if (n < 1) n = 1; if (n > 32) n = 32;
+    });
+    return n;
+}
+static int warm_threads_now(void) { int n = warm_threads(); return n > 2 && atomic_load(&g_warm_in_play) ? 2 : n; }
+typedef struct { _Atomic size_t next; os_unfair_lock lock; } warm_par;
+/* Load the shaders named by keys / stages into dict, each once, on warm_threads_now() threads. */
+static void warm_load_keys(NSArray<NSString *> *keys, NSArray<NSNumber *> *stages, NSMutableDictionary<NSString *, NvShader *> *dict) {
+    NSMutableArray<NSString *> *todo = [NSMutableArray array]; NSMutableArray<NSNumber *> *st = [NSMutableArray array];
+    NSMutableSet<NSString *> *want = [NSMutableSet set];
+    for (NSUInteger i = 0; i < keys.count; i++) {
+        NSString *k = keys[i];
+        if (!k.length || dict[k] || [want containsObject:k] || warm_failed(k)) continue;
+        [want addObject:k]; [todo addObject:k]; [st addObject:stages[i]];
+    }
+    size_t n = todo.count, workers = (size_t)warm_threads_now();
+    if (!n) return;
+    if (workers <= 1 || n == 1) { for (size_t i = 0; i < n; i++) @autoreleasepool { warm_shader(dict, todo[i], st[i].intValue); } return; }
+    if (workers > n) workers = n;
+    warm_par *wp = calloc(1, sizeof *wp); if (!wp) MDIE("预热：内存不足");
+    wp->lock = OS_UNFAIR_LOCK_INIT;
+    dispatch_apply(workers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t w) {
+        for (;;) @autoreleasepool {
+            if (w && w >= (size_t)warm_threads_now()) break;   // fewer threads once playing; thread 0 always goes on
+            size_t i = atomic_fetch_add(&wp->next, 1);
+            if (i >= n) break;
+            NSString *key = todo[i];
+            NvShader *sh = warm_shader_load(key, st[i].intValue);
+            if (!sh) { warm_fail(key); continue; }
+            os_unfair_lock_lock(&wp->lock); dict[key] = sh; os_unfair_lock_unlock(&wp->lock);
+        }
+    });
+    free(wp);
+}
+/* The shaders a block of warm-list rows names (S: the shader, R: its vertex and fragment shaders, C: the compute shader). */
+static void warm_load_rows(NSArray<NSString *> *rows, NSMutableDictionary<NSString *, NvShader *> *dict) {
+    NSMutableArray<NSString *> *keys = [NSMutableArray array]; NSMutableArray<NSNumber *> *stages = [NSMutableArray array];
+    for (NSString *line in rows) {
+        NSArray<NSString *> *c = [line componentsSeparatedByString:@"\t"];
+        if ([c[0] isEqualToString:@"S"] && c.count >= 3) { [keys addObject:c[1]]; [stages addObject:@(c[2].intValue)]; }
+        else if ([c[0] isEqualToString:@"R"] && c.count >= 2) {
+            pso_skey sk; if (pso_skey_parse(c[1].UTF8String, &sk)) continue;
+            NSString *vkey = warm_key(sk.vs, sizeof sk.vs), *fkey = warm_key(sk.fs, sizeof sk.fs);
+            if (vkey.length) { [keys addObject:vkey]; [stages addObject:@(sk.vs_stage)]; }
+            if (fkey.length) { [keys addObject:fkey]; [stages addObject:@(sk.fs_stage)]; }
+        } else if ([c[0] isEqualToString:@"C"] && c.count >= 2 && c[1].length) { [keys addObject:c[1]]; [stages addObject:@5]; }
+    }
+    warm_load_keys(keys, stages, dict);
 }
 static void warm_enqueue(WarmItem *item) {
     os_unfair_lock_lock(&g_warm_lock);
@@ -6096,50 +6453,58 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
         NSMutableDictionary<NSString *, NvShader *> *dict = [NSMutableDictionary dictionary];
         NSMutableSet<NSString *> *seen = [NSMutableSet set];
         NSUInteger path_index = 0;
+        MLOG("后台预热：着色器库用 %d 个线程编（TOTK_WARM_THREADS），进世界后最多 2 个", warm_threads());
         uint64_t done = 0;
         for (NSString *path in paths) {
             NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
             if (!txt) { MLOG("【红】预热清单读取失败：%s", path.UTF8String);
                 if (path_index++ == 0) atomic_store(&g_warm_priority_done, 1); continue; }
+            NSMutableArray<NSString *> *todo = [NSMutableArray array];
             for (NSString *line in [txt componentsSeparatedByString:@"\n"]) {
                 if (![eligible containsObject:line] || [seen containsObject:line]) continue;
-                [seen addObject:line];
-                NSArray<NSString *> *c = [line componentsSeparatedByString:@"\t"];
-                if (!c.count) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
-                if ([c[0] isEqualToString:@"S"] && c.count >= 3) {
-                    NSString *key = c[1]; NvShader *sh = warm_shader(dict, key, c[2].intValue);
-                    if (!sh) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
-                    WarmItem *item = [WarmItem new]; item->kind = 0; item->key = key; item->shader = sh;
-                    warm_enqueue(item);
-                } else if ([c[0] isEqualToString:@"R"] && c.count >= 2) {
-                    pso_skey sk; if (pso_skey_parse(c[1].UTF8String, &sk)) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
-                    NSString *vkey = warm_key(sk.vs, sizeof sk.vs), *fkey = warm_key(sk.fs, sizeof sk.fs);
-                    NvShader *vs = vkey.length ? warm_shader(dict, vkey, sk.vs_stage) : nil;
-                    NvShader *fs = fkey.length ? warm_shader(dict, fkey, sk.fs_stage) : nil;
-                    if (!vs || (fkey.length && !fs)) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
-                    id<MTLFunction> fsfn = nil;
-                    if (sk.fz) {
-                        if (sk.fz_desc.kind == 1 && fs) { int fx[32]; for (int i = 0; i < 32; i++) fx[i] = sk.fz_desc.fx[i]; fsfn = bf_fn(fs, fx, sk.fz_desc.fbmask, sk.k.lmap); }
-                                                if (!fsfn) { g_warm_skip_fz++; warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+                [seen addObject:line]; [todo addObject:line];
+            }
+            for (NSUInteger at = 0; at < todo.count; at += WARM_BLOCK) @autoreleasepool {
+                NSArray<NSString *> *block = [todo subarrayWithRange:NSMakeRange(at, MIN((NSUInteger)WARM_BLOCK, todo.count - at))];
+                warm_load_rows(block, dict);   // the block's shaders on several threads; its pipelines below, in list order
+                for (NSString *line in block) {
+                    NSArray<NSString *> *c = [line componentsSeparatedByString:@"\t"];
+                    if (!c.count) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+                    if ([c[0] isEqualToString:@"S"] && c.count >= 3) {
+                        NSString *key = c[1]; NvShader *sh = warm_shader(dict, key, c[2].intValue);
+                        if (!sh) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+                        WarmItem *item = [WarmItem new]; item->kind = 0; item->key = key; item->shader = sh;
+                        warm_enqueue(item);
+                    } else if ([c[0] isEqualToString:@"R"] && c.count >= 2) {
+                        pso_skey sk; if (pso_skey_parse(c[1].UTF8String, &sk)) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+                        NSString *vkey = warm_key(sk.vs, sizeof sk.vs), *fkey = warm_key(sk.fs, sizeof sk.fs);
+                        NvShader *vs = vkey.length ? warm_shader(dict, vkey, sk.vs_stage) : nil;
+                        NvShader *fs = fkey.length ? warm_shader(dict, fkey, sk.fs_stage) : nil;
+                        if (!vs || (fkey.length && !fs)) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+                        id<MTLFunction> fsfn = nil;
+                        if (sk.fz) {
+                            if (sk.fz_desc.kind == 1 && fs) { int fx[32]; for (int i = 0; i < 32; i++) fx[i] = sk.fz_desc.fx[i]; fsfn = bf_fn(fs, fx, sk.fz_desc.fbmask, sk.k.lmap); }
+                                                    if (!fsfn) { g_warm_skip_fz++; warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+                        }
+                        pso_key k = sk.k; k.vs = (__bridge void *)vs; k.fs = (__bridge void *)fs; k.fsfn = (__bridge void *)fsfn;
+                        NSError *e = nil; uint64_t ps_started = bp_now();
+                        id ps = [g_dev newRenderPipelineStateWithDescriptor:pso_desc(&k, vs, fs, fsfn, sk.merged) error:&e];
+                        atomic_fetch_add(&g_warm_pipeline_ns, bp_now() - ps_started); atomic_fetch_add(&g_warm_pipeline_count, 1);
+                        if (!ps) { MLOG("【红】后台建渲染管线失败：%s", e.localizedDescription.UTF8String); warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+                        WarmItem *item = [WarmItem new]; item->kind = 1; item->vs_key = vkey; item->fs_key = fkey; item->vs = vs; item->fs = fs; item->fsfn = fsfn; item->pso = k; item->object = ps;
+                        warm_enqueue(item); g_warm_rps++;
+                    } else if ([c[0] isEqualToString:@"C"] && c.count >= 2) {
+                        NSString *key = c[1]; if (!key.length) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+                        NvShader *cs = warm_shader(dict, key, 5);
+                        if (!cs) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+                        NSError *e = nil; uint64_t ps_started = bp_now(); id ps = [g_dev newComputePipelineStateWithFunction:cs->fn error:&e];
+                        atomic_fetch_add(&g_warm_pipeline_ns, bp_now() - ps_started); atomic_fetch_add(&g_warm_pipeline_count, 1);
+                        if (!ps) { MLOG("【红】后台建计算管线失败：%s", e.localizedDescription.UTF8String); warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+                        WarmItem *item = [WarmItem new]; item->kind = 2; item->key = key; item->shader = cs; item->object = ps;
+                        warm_enqueue(item); g_warm_cps++;
                     }
-                    pso_key k = sk.k; k.vs = (__bridge void *)vs; k.fs = (__bridge void *)fs; k.fsfn = (__bridge void *)fsfn;
-                    NSError *e = nil; uint64_t ps_started = bp_now();
-                    id ps = [g_dev newRenderPipelineStateWithDescriptor:pso_desc(&k, vs, fs, fsfn, sk.merged) error:&e];
-                    atomic_fetch_add(&g_warm_pipeline_ns, bp_now() - ps_started); atomic_fetch_add(&g_warm_pipeline_count, 1);
-                    if (!ps) { MLOG("【红】后台建渲染管线失败：%s", e.localizedDescription.UTF8String); warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
-                    WarmItem *item = [WarmItem new]; item->kind = 1; item->vs_key = vkey; item->fs_key = fkey; item->vs = vs; item->fs = fs; item->fsfn = fsfn; item->pso = k; item->object = ps;
-                    warm_enqueue(item); g_warm_rps++;
-                } else if ([c[0] isEqualToString:@"C"] && c.count >= 2) {
-                    NSString *key = c[1]; if (!key.length) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
-                    NvShader *cs = warm_shader(dict, key, 5);
-                    if (!cs) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
-                    NSError *e = nil; uint64_t ps_started = bp_now(); id ps = [g_dev newComputePipelineStateWithFunction:cs->fn error:&e];
-                    atomic_fetch_add(&g_warm_pipeline_ns, bp_now() - ps_started); atomic_fetch_add(&g_warm_pipeline_count, 1);
-                    if (!ps) { MLOG("【红】后台建计算管线失败：%s", e.localizedDescription.UTF8String); warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
-                    WarmItem *item = [WarmItem new]; item->kind = 2; item->key = key; item->shader = cs; item->object = ps;
-                    warm_enqueue(item); g_warm_cps++;
+                    warm_task_done(&done,total,shader_total,pipeline_total,dict);
                 }
-                warm_task_done(&done,total,shader_total,pipeline_total,dict);
             }
             if (path_index++ == 0) atomic_store(&g_warm_priority_done, 1);
         }
@@ -6163,7 +6528,8 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
         }
         if (runtime_warm_progress) runtime_warm_progress(done,total,dict.count,shader_total,g_warm_rps+g_warm_cps,pipeline_total);
         uint64_t cached = 0, failed = 0;
-        for (NSString *file in cache_files) {
+        NSMutableArray<NSString *> *lkeys = [NSMutableArray array]; NSMutableArray<NSNumber *> *lstages = [NSMutableArray array];
+        for (NSString *file in cache_files) @autoreleasepool {
             if (![file hasSuffix:@"_b.metal"]) continue;
             NSString *key = [file stringByDeletingPathExtension];
             if (dict[key]) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
@@ -6173,17 +6539,26 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
             NSString *stage = j[@"stage"];
             int st = [stage isEqual:@"vs"] ? 0 : [stage isEqual:@"ps"] ? 1 : [stage isEqual:@"cs"] ? 5 : -1;
             if (st < 0 || ![j[@"chain"] isEqual:@DMSH_CHAIN]) { failed++; warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
-            NvShader *sh = warm_shader(dict, key, st);
-            if (!sh) { failed++; warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
-            WarmItem *item = [WarmItem new]; item->kind = 0; item->key = key; item->shader = sh;
-            warm_enqueue(item); cached++;
-            warm_task_done(&done,total,shader_total,pipeline_total,dict);
+            [lkeys addObject:key]; [lstages addObject:@(st)];
+        }
+        for (NSUInteger at = 0; at < lkeys.count; at += WARM_BLOCK) @autoreleasepool {   // on several threads, a block at a time
+            NSRange r = NSMakeRange(at, MIN((NSUInteger)WARM_BLOCK, lkeys.count - at));
+            NSArray<NSString *> *block = [lkeys subarrayWithRange:r];
+            warm_load_keys(block, [lstages subarrayWithRange:r], dict);
+            for (NSString *key in block) {
+                NvShader *sh = dict[key];
+                if (!sh) { failed++; warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+                WarmItem *item = [WarmItem new]; item->kind = 0; item->key = key; item->shader = sh;
+                warm_enqueue(item); cached++;
+                warm_task_done(&done,total,shader_total,pipeline_total,dict);
+            }
         }
         if (runtime_warm_progress) runtime_warm_progress(done,total,dict.count,shader_total,g_warm_rps+g_warm_cps,pipeline_total);
         MLOG("缓存补充预热：新增 %llu 个着色器，%llu 个失败；清单里还不在翻译缓存的着色器 %llu 个（第一次用到时现翻，自动收集）", cached, failed, (unsigned long long)g_warm_missing);
-        MLOG("管线预热完成：着色器 %llu 个 / 渲染管线 %llu 个（跳过特化片元 %llu）/ 计算管线 %llu 个，后台用时 %.1f ms",
-             (unsigned long long)dict.count, g_warm_rps, g_warm_skip_fz, g_warm_cps, (bp_now() - g_warm_t0) / 1e6);
-        MLOG("预热分段：着色器库 %llu 次 / %.1f ms，Metal 管线 %llu 次 / %.1f ms",
+        MLOG("管线预热完成：着色器 %llu 个 / 渲染管线 %llu 个（跳过特化片元 %llu）/ 计算管线 %llu 个，后台用时 %.1f ms（着色器库 %d 个线程%s）",
+             (unsigned long long)dict.count, g_warm_rps, g_warm_skip_fz, g_warm_cps, (bp_now() - g_warm_t0) / 1e6, warm_threads(),
+             atomic_load(&g_warm_in_play) && warm_threads() > 2 ? "，进世界后 2 个" : "");
+        MLOG("预热分段：着色器库 %llu 次 / %.1f ms（各线程用时相加），Metal 管线 %llu 次 / %.1f ms",
              (unsigned long long)atomic_load(&g_warm_library_count),atomic_load(&g_warm_library_ns)/1e6,
              (unsigned long long)atomic_load(&g_warm_pipeline_count),atomic_load(&g_warm_pipeline_ns)/1e6);
     }
@@ -6198,6 +6573,7 @@ int mtl_warm_wait(int timeout_ms) {
     if (!atomic_load(&g_warm_running)) return 0;
     uint64_t t0 = bp_now();
     while (atomic_load(&g_warm_running) && (timeout_ms < 0 || (bp_now() - t0) / 1000000ull < (uint64_t)timeout_ms)) usleep(2000);
+    atomic_store(&g_warm_in_play, 1);   // the player goes into the world: the rest of the warm-up uses at most 2 threads
     return (int)((bp_now() - t0) / 1000000ull) + 1;
 }
 /* TOTK (iOS): variants the phone was missing (shader-requests/, written by totk_rt_variant) that fill_shaders.py has since
@@ -6287,18 +6663,27 @@ static void warm_start(void) {
     if (e && *e) {
         paths = @[@(e)];
     } else {
-        NSString *seed = [g_shmap_path.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"pso_manifest.tsv"];
+        NSFileManager *fm = NSFileManager.defaultManager;
+        NSString *dir = g_shmap_path.stringByDeletingLastPathComponent;
+        NSString *title = [dir stringByAppendingPathComponent:@"pso_title.tsv"];
+        NSString *seed = [dir stringByAppendingPathComponent:@"pso_manifest.tsv"];
         NSMutableArray<NSString *> *all = [NSMutableArray array];
-        // This selected-version seed has real MSL/reflection, including on a
-        // fresh install. Warm it before the title; identifiers alone cannot warm.
-        const char *seedMode = getenv("TOTK_SHADER_SEED");
-        NSString *prepared = [g_shmap_path.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"shader-seed/pso_manifest.tsv"];
-        if (!(seedMode && !strcmp(seedMode, "off")) && [NSFileManager.defaultManager fileExistsAtPath:prepared]) [all addObject:prepared];
-        if ([NSFileManager.defaultManager fileExistsAtPath:seed]) [all addObject:seed];
+        // The first list is the one the first frame waits for (g_warm_priority_done below): only what the title screen,
+        // its menu and the save list use (pso_title.tsv, recorded 2026-10-18 on 1.4.3, 1.1.2 and 1.0.0; rows of another
+        // version are not in this cache and are skipped like any missing row). With the
+        // 8,290 prepared shaders first the title came after 7-8 s even with warm caches and after about 10 minutes on a
+        // Mac whose Metal cache has never seen them. Without the title list the game's manifest goes first, as before.
+        if ([fm fileExistsAtPath:title]) [all addObject:title];
+        if ([fm fileExistsAtPath:seed]) [all addObject:seed];
         NSString *user = pso_user_path();
-        if (user && [NSFileManager.defaultManager fileExistsAtPath:user]) [all addObject:user];
+        if (user && [fm fileExistsAtPath:user]) [all addObject:user];
         NSString *shared = pso_shared_path();   // what every session collected (pso_user_record)
-        if ([NSFileManager.defaultManager fileExistsAtPath:shared]) [all addObject:shared];
+        if ([fm fileExistsAtPath:shared]) [all addObject:shared];
+        // The selected version's prepared shaders (real MSL, also on a fresh install) come last: they are shader libraries
+        // only, while the lists above also build the pipelines the first scenes need.
+        const char *seedMode = getenv("TOTK_SHADER_SEED");
+        NSString *prepared = [dir stringByAppendingPathComponent:@"shader-seed/pso_manifest.tsv"];
+        if (!(seedMode && !strcmp(seedMode, "off")) && [fm fileExistsAtPath:prepared]) [all addObject:prepared];
         paths = all;
         NSMutableString *desc = [NSMutableString string];
         for (NSString *p in paths) { NSString *t = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
@@ -6317,8 +6702,8 @@ static void warm_start(void) {
     dispatch_queue_t q = dispatch_queue_create("dm.nvn.pso-warm", attr);
     atomic_store(&g_warm_running, 1);
     dispatch_async(q, ^{ warm_worker(paths,files,eligible,planned_keys,total,shader_total,pipeline_total); });
-    // The title's seed manifest must be ready before its first frame. The
-    // profile-specific list and remaining translated variants finish behind
+    // The title's list must be ready before its first frame. The other lists,
+    // the prepared shaders and the remaining translated variants finish behind
     // the menu, then mtl_warm_wait at save-load waits before entering play.
     uint64_t wait_start = bp_now();
     while (!atomic_load(&g_warm_priority_done)) usleep(2000);
@@ -7207,18 +7592,33 @@ static void pso_predict_rest(void) {
     static int enabled = -1; if (enabled < 0) { const char *e = getenv("TOTK_PSO_PREDICT"); enabled = !e || atoi(e); }
     if (!enabled) return;
     if (!g_exec_next) return;
+    // Bound speculative work. Submit likely keys as they are found instead of
+    // making the current draw wait for the entire scan before any worker starts.
+    // Budget per scan: commands, keys (each of the two queues), microseconds -- TOTK_PSO_PREDICT_SCAN / _KEYS / _US.
+    enum { QN = 160 }; static int max_ops = -1, max_keys, max_us;
+    if (max_ops < 0) {
+        const char *e = getenv("TOTK_PSO_PREDICT_SCAN"); int ops = e ? atoi(e) : 8192;
+        e = getenv("TOTK_PSO_PREDICT_KEYS"); max_keys = e ? atoi(e) : 32; if (max_keys < 1) max_keys = 1; if (max_keys > QN) max_keys = QN;
+        e = getenv("TOTK_PSO_PREDICT_US"); max_us = e ? atoi(e) : 2000; if (max_us < 1) max_us = 1;
+        max_ops = ops < 1 ? 1 : ops;
+        MLOG("[totk] pipeline prediction: after a submission's first pipeline miss, scans at most %d commands, %d keys, %d us", max_ops, max_keys, max_us);
+    }
     static typeof(S) Ssave; memcpy(&Ssave, &S, sizeof S); typeof(R) Rsave = R;
     int pso_dirty = g_pso_dirty, dss_dirty = g_dss_dirty;
     uint32_t cf[8]; memcpy(cf, g_pass.cfmt, sizeof cf); uint32_t df = g_pass.dfmt, sf = g_pass.sfmt, samples = g_pass.samples, dfull = df, sfull = sf; int kicked0 = (int)g_pp_kicked, draws = 0;
     fz_cursor cur = {.p = g_exec_next};
-    // 先收齐再丢：按「附件原样挂」的键排在前（最可能用到），其余挂法排在后——后台并发有限，先丢的先编完
-    // Collect them all first, then dispatch: keys for "attachments attached as-is" go first (most likely to be used), the other attach modes after -- background concurrency is limited, and what is dispatched first is compiled first
-    enum { QN = 160 }; static struct { pso_key k; void *vs, *fs; } qa[QN], qb[QN]; int na = 0, nb = 0;
-    for (int guard = 0; guard < 200000 && na < QN; guard++) {
+    uint64_t started = bp_now();
+    static struct { pso_key k; void *vs, *fs; } qa[QN], qb[QN]; int na = 0, nb = 0;
+    int guard = 0, stop = 0;   // which budget ended the scan: 1 commands, 2 keys, 3 time (0: end of the submission)
+    for (; ; guard++) {
+        if (guard >= max_ops) { stop = 1; break; }
+        if (na >= max_keys) { stop = 2; break; }
+        if (bp_now() - started > (uint64_t)max_us * 1000ull) { stop = 3; break; }
         const uint8_t *q; op_hdr hq; const void *aq;
         if (!fz_next(&cur, &q, &hq, &aq)) break;
         if (hq.op == OP_SET_RT) {
             const p_set_rt *r = aq; memset(cf, 0, sizeof cf); dfull = sfull = 0; samples = 1;
+            R.rt = *r; R.has_rt = 1;
             /* Prediction must not acquire/recreate/upload textures on the active GPU timeline. */
             for (int i = 0; i < r->n && i < 8; i++) { MTLTextureDescriptor *d = r->color[i] ? tex_desc(r->color[i], tex_mirrored(r->color[i])) : nil;
                 if (d) { cf[i] = (uint32_t)attachment_format(r->color[i], &r->cview[i], r->has_cview[i], d.pixelFormat); samples = (uint32_t)d.sampleCount; } }
@@ -7231,18 +7631,17 @@ static void pso_predict_rest(void) {
         }
         if (hq.op == OP_DRAW || hq.op == OP_DRAW_IDX) {
             draws++;
-            __unsafe_unretained NvProg *pr = S.prog ? prog_get(S.prog) : nil; if (!pr || !pr->sh[0]) continue;
-            __unsafe_unretained NvShader *vs = pr->sh[0], *fs = pr->sh[1];
-            const uint32_t dv[4] = {dfull, 0, 0, dfull}, sv[4] = {sfull, 0, sfull, 0};
+            NvShader *vs = nil, *fs = nil;
+            if (!prog_prediction_stages(S.prog, &vs, &fs)) continue;
             for (int v = 0; v < 4; v++) {
-                if (v && dv[v] == dv[0] && sv[v] == sv[0]) continue;
-                if (v == 2 && !sfull) continue; if (v == 3 && (!dfull || !sfull)) continue;
-                pso_key k; pso_key_fill(&k, vs, fs, cf, dv[v], sv[v], samples, 0);
+                if (!pred_guess_wanted(v, dfull, sfull, fs)) continue;
+                pso_key k; pso_key_fill(&k, vs, fs, cf, PRED_DEPTH[v] ? dfull : 0, PRED_STENCIL[v] ? sfull : 0, samples, 0);
                 if (hm_get_id(&g_pso, &k)) continue;
                 int dup = 0; for (int i = 0; i < (v ? nb : na) && !dup; i++) dup = !memcmp(&(v ? qb : qa)[i].k, &k, sizeof k);
                 if (dup) continue;
-                if (!v && na < QN) { qa[na].k = k; qa[na].vs = (__bridge void *)vs; qa[na].fs = (__bridge void *)fs; na++; }
-                else if (v && nb < QN) { qb[nb].k = k; qb[nb].vs = (__bridge void *)vs; qb[nb].fs = (__bridge void *)fs; nb++; }
+                if (!v && na < max_keys) { qa[na].k = k; qa[na].vs = (__bridge void *)vs; qa[na].fs = (__bridge void *)fs; na++;
+                    pso_pend_kick(&k, vs, fs); }
+                else if (v && nb < max_keys) { qb[nb].k = k; qb[nb].vs = (__bridge void *)vs; qb[nb].fs = (__bridge void *)fs; nb++; }
             }
             continue;
         }
@@ -7250,10 +7649,19 @@ static void pso_predict_rest(void) {
         state_op(hq.op, aq);
     }
     (void)df; (void)sf;
-    for (int i = 0; i < na; i++) pso_pend_kick(&qa[i].k, (__bridge NvShader *)qa[i].vs, (__bridge NvShader *)qa[i].fs);
     for (int i = 0; i < nb; i++) pso_pend_kick(&qb[i].k, (__bridge NvShader *)qb[i].vs, (__bridge NvShader *)qb[i].fs);
     memcpy(&S, &Ssave, sizeof S); R = Rsave; args_dirty_all(); g_pso_dirty = pso_dirty; g_dss_dirty = dss_dirty;
     static int logged; if (g_pp_kicked > (uint64_t)kicked0 && logged++ < 20) MLOG("并行预编：本次提交余下 %d 次绘制，丢给后台 %d 条管线", draws, (int)g_pp_kicked - kicked0);
+    g_pp_scans++; g_pp_scan_ns += bp_now() - started; if (stop) g_pp_stop[stop - 1]++;
+    if (g_pp_scans % 100 == 0) {
+        pthread_mutex_lock(&g_pp_mu); uint64_t full = g_pp_full, freed = g_pp_reclaimed, waits = g_pp_waits, wait_ns = g_pp_wait_ns; int busy = 0;
+        for (int i = 0; i < PSO_PEND_MAX; i++) busy += g_pp[i].used; pthread_mutex_unlock(&g_pp_mu);
+        MLOG("并行预编 至提交 %llu：扫描 %llu 次（平均 %.2f ms；到上限：命令 %llu、键 %llu、时间 %llu），后台开编 %llu 条，绘制领用 %llu 条（等后台 %llu 次共 %.1f ms），表满没收 %llu 条，回收没用上的 %llu 条，表里现有 %d 条",
+             (unsigned long long)g_sub_serial, (unsigned long long)g_pp_scans, g_pp_scan_ns / 1e6 / (double)g_pp_scans,
+             (unsigned long long)g_pp_stop[0], (unsigned long long)g_pp_stop[1], (unsigned long long)g_pp_stop[2],
+             (unsigned long long)g_pp_kicked, (unsigned long long)g_pp_taken, (unsigned long long)waits, wait_ns / 1e6,
+             (unsigned long long)full, (unsigned long long)freed, busy);
+    }
 }
 
 /* Prediction visits later scissor commands but must leave the active draw's state untouched. */
@@ -7270,8 +7678,62 @@ void dm_nvn_probe_prediction(void) {
     struct {op_hdr h;p_render_cond c;op_hdr end;} cond={{OP_RENDER_COND,8+sizeof(p_render_cond)},{0},{OP_END,8}};
     const void *op=&cond;unsigned slot=((uintptr_t)op>>3)&1023;cond_cache_ent cache=g_cond_cache[slot];uint64_t unknown=g_draw_skip[14];
     g_exec_next=(const uint8_t *)&cond;pso_predict_rest();
-    if(getenv("TOTK_PROBE_NEGATIVE"))state_op(OP_RENDER_COND,&cond.c);
+    if(pred_negative()>0&&pred_negative()<24)state_op(OP_RENDER_COND,&cond.c);   // older negative numbers; 24-27 are the checks below
     if(memcmp(&cache,&g_cond_cache[slot],sizeof cache)||g_draw_skip[14]!=unknown)MDIE("pipeline prediction evaluated a future conditional counter");
+    // A speculative future program need not be resolved. Calling prog_get here
+    // would try to translate its absent bytes (or compile real future shaders).
+    prog_t future = {.nstage = 1, .serial = UINT64_MAX - 17};
+    struct { op_hdr bind; p_bind_program program; op_hdr draw; p_draw args; op_hdr end; } cold = {
+        {OP_BIND_PROGRAM, 8 + sizeof(p_bind_program)}, {&future, 3},
+        {OP_DRAW, 8 + sizeof(p_draw)}, {0}, {OP_END, 8}
+    };
+    typeof(S) saved_state = S;
+    uint64_t old_libs = g_bp_lib_n, old_psos = g_bp_pso_n;
+    g_exec_next = (const uint8_t *)&cold; pso_predict_rest();
+    if (g_bp_lib_n != old_libs || g_bp_pso_n != old_psos || memcmp(&S, &saved_state, sizeof S))
+        MDIE("pipeline prediction compiled a future program or changed bindings");
+    // A cached program may need a different binding variant while scanning.
+    // Resolving it for prediction must neither compile nor select it for a draw.
+    NvProg *pr = [NvProg new]; NvShader *active = [NvShader new], *alternate = [NvShader new];
+    uint64_t signature = stage_sig(0);
+    pr->sh[0] = active; pr->sig[0] = signature ^ 1;
+    pr->alt[0] = [NSMutableDictionary dictionaryWithObject:alternate forKey:@(signature)];
+    prog_t cached = {.serial = nvn_new_serial()};
+    serial_put(cached.serial, pr);
+    NvShader *vs = nil, *fs = nil;
+    if (!prog_prediction_stages(&cached, &vs, &fs) || vs != alternate || pr->sh[0] != active || pr->sig[0] != (signature ^ 1))
+        MDIE("pipeline prediction selected a binding variant for the active draw");
+    [pr->alt[0] removeAllObjects];
+    if (prog_prediction_stages(&cached, &vs, &fs) || pr->sh[0] != active)
+        MDIE("pipeline prediction resolved a missing binding variant");
+    // A program with a stage not translated yet (iOS) draws nothing; its fragment stage can be absent.
+    pr->sig[0] = signature; pr->missing = 2;
+    if (prog_prediction_stages(&cached, &vs, &fs))
+        MDIE("pipeline prediction predicted a program with an untranslated stage");
+    serial_del(cached.serial);
+    // A depth-exporting fragment function gets the pass's depth buffer: guesses without it are never used.
+    NvShader *depth_fs = [NvShader new], *color_fs = [NvShader new]; depth_fs->writes_depth = 1;
+    const uint32_t d32 = MTLPixelFormatDepth32Float, ds8 = MTLPixelFormatDepth32Float_Stencil8;
+    if (!pred_guess_wanted(0, d32, 0, depth_fs) || pred_guess_wanted(1, d32, 0, depth_fs) || pred_guess_wanted(2, ds8, ds8, depth_fs)
+        || !pred_guess_wanted(3, ds8, ds8, depth_fs) || !pred_guess_wanted(0, 0, 0, depth_fs))
+        MDIE("pipeline prediction guessed a pass without depth for a depth-exporting fragment function");
+    if (!pred_guess_wanted(1, d32, 0, color_fs) || !pred_guess_wanted(2, ds8, ds8, color_fs) || pred_guess_wanted(3, d32, 0, color_fs)
+        || pred_guess_wanted(2, d32, 0, color_fs))
+        MDIE("pipeline prediction attach-mode guesses changed");
+
+    // Reclaim completed stale guesses, but retain recent completions and even
+    // very old unfinished jobs (their workers can still publish into the slot).
+    pthread_mutex_lock(&g_pp_mu);
+    for (int i = 0; i < PSO_PEND_MAX; i++) if (g_pp[i].used) MDIE("prediction probe requires an idle pending table");
+    g_pp[0].used = g_pp[0].done = 1; g_pp[0].submit = 9;
+    g_pp[1].used = g_pp[1].done = 1; g_pp[1].submit = 10;
+    g_pp[2].used = 1; g_pp[2].done = 0; g_pp[2].submit = 1;
+    pso_pend_reclaim(12);
+    if (g_pp[0].used || !g_pp[1].used || !g_pp[2].used)
+        MDIE("pipeline prediction recycled an in-flight or recent pending slot");
+    g_pp[2].done = 1; pso_pend_reclaim(13);
+    if (g_pp[1].used || g_pp[2].used) MDIE("pipeline prediction retained completed stale guesses");
+    pthread_mutex_unlock(&g_pp_mu);
     R = saved; g_exec_next = next;
 }
 
@@ -8468,7 +8930,7 @@ static void clear_quad_core(id<MTL4RenderCommandEncoder> en, const uint32_t cfmt
         NSString *src = [NSString stringWithFormat:@"#include <metal_stdlib>\nusing namespace metal;\nconstant float4 cc [[function_constant(0)]];\n"
             "vertex float4 cq_vs(uint id [[vertex_id]]) { float2 p = float2((id << 1) & 2, id & 2); return float4(p * 2 - 1, 0, 1); }\n"
             "struct O { float4 c [[color(%d)]]; };\nfragment O cq_fs() { O o; o.c = cc; return o; }\n", index];
-        NSError *e = nil; libs[index] = [g_dev newLibraryWithSource:src options:totk_precise_opts() error:&e];
+        NSError *e = nil; libs[index] = totk_msl_library(src, &e);
         if (!libs[index]) MDIE("clear shader: %s", e.localizedDescription.UTF8String);
     }
     NSString *key = [NSString stringWithFormat:@"%d/%x/%u,%u,%u,%u,%u,%u,%u,%u/%u/%u/%u/%a,%a,%a,%a", index, mask, cfmt[0], cfmt[1], cfmt[2], cfmt[3], cfmt[4], cfmt[5], cfmt[6], cfmt[7],
@@ -9082,7 +9544,7 @@ static int mfxup_dock(__unsafe_unretained NvShader *fs) {
     if (!why && hv && ((cv->set_levels && cv->base_level) || (cv->set_layers && cv->min_layer))) why = 1;   // the canvas's own level 0 / layer 0 (its view names layer 0: still the whole texture)
     int tid = (int)(S.tex[1][0] & 0xfffff);
     id<MTLTexture> src = !why && tid > 0 ? (__bridge id<MTLTexture>)tex_fast(tid) : nil, dst = src ? attachment_texture(R.rt.color[0], cv, hv) : nil;
-    if (!why && (!src || !dst || src.textureType != MTLTextureType2D || dst.textureType != MTLTextureType2D || src.width >= dst.width || src.height >= dst.height)) why = 3;
+    if (!why && (!src || !dst || src.textureType != MTLTextureType2D || dst.textureType != MTLTextureType2D)) why = 3;
     if (!why && ((S.has_vp && !(S.vp[0][0] == 0 && S.vp[0][1] == 0 && S.vp[0][2] == (float)dst.width && S.vp[0][3] == (float)dst.height)) ||
                  !scissor_full(R.rt.color[0], cv, hv))) why = 4;
     NSUInteger cw = 0, ch = 0; float k[20] = {0}; uint32_t ow = 0, oh = 0;
@@ -9102,6 +9564,9 @@ static int mfxup_dock(__unsafe_unretained NvShader *fs) {
         MLOG("[mfx-up] 主机模式放大点 %.8s（%s）：源 %lux%lu（格式 %lu）→ 画布 %lux%lu（格式 %lu）；常量 con0 %g %g %g %g、输出 %ux%u → 有效区域 %lux%lu%s",
              fs->key, hdr ? "HDR" : "perceptual", (unsigned long)src.width, (unsigned long)src.height, (unsigned long)src.pixelFormat, (unsigned long)dst.width, (unsigned long)dst.height, (unsigned long)dst.pixelFormat,
              k[0], k[1], k[2], k[3], ow, oh, (unsigned long)cw, (unsigned long)ch, why ? "：常量不符，保留游戏自己的放大" : ""); } }
+    // the scene's content, not its texture, must be smaller than the canvas: a reused scene texture can be allocated
+    // larger than the content the game drew (dynamic resolution, a size changed while playing) (from PR #42)
+    if (!why && (cw >= dst.width || ch >= dst.height)) why = 3;
     if (why) {
         static int told[6]; if (!told[why]++)   // the first refusal of each kind, with what was seen
             MLOG("[mfx-up] 主机模式放大点 %.8s 不替换（原因 %d：1 目标 / 2 混合掩码深度 / 3 贴图 / 4 视口剪裁 / 5 常量）：附件 %d 个，视图 %d（级 %d:%u 层 %d:%u），"
@@ -9325,6 +9790,7 @@ frz_plain:;
         PD("L %llu 分层通道内的绘制不能写层号，在此切开", g_stat_pass); rp_end(); g_lay.refuse = 1; g_lay.refused++; }
     if (!g_mfx.scene_done && g_mfx.canvas && R.rt.n > 0 && R.rt.color[0] && R.rt.color[0]->serial == g_mfx.canvas && pr && pr->sh[0] && mfx_ui_vs(pr->sh[0]->key) && mfx_enabled())
         mfx_snapshot_scene();   // TOTK_MFX: first UI draw into the canvas: copy the finished scene first
+    if (!g_uw_ui && uw_on_canvas() && pr && pr->sh[0] && mfx_ui_vs(pr->sh[0]->key)) g_uw_ui = 1;   // key 4: the UI begins
     id<MTLRenderCommandEncoder> en = rp_begin_ex(mode);
     g_fd_dw = NULL; g_fd_di = NULL;
     if (!en) { g_draw_skip[8]++; return; }
@@ -9347,7 +9813,7 @@ frz_plain:;
     // The pipeline depends only on (program, render pass targets, blend / color / write mask / multisample state, vertex layout): if these did not change, reuse the previous one
     static id<MTLRenderPipelineState> cur_ps; static NvProg *cur_pr; static uint64_t cur_ps_pass;
     if (g_fz.active && !g_defer_replaying) { g_pso_lmap = g_fz.phase == 1 ? g_fz.lmap1 : g_fz.lmap2; g_pso_fsfn = g_fz.phase == 1 ? nil : fz_fn; g_pso_fz = g_fz.phase == 1 ? (pso_fz_desc){0} : g_fz_desc; g_pso_dirty = 1; }   // 可读 tile 合并：按物理 → 逻辑映射与特化取管线 | Readable tile merge: fetch the pipeline by the physical -> logical mapping and the specialization
-    if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial) { cur_ps = pso_get(pr, nil); cur_pr = pr; cur_ps_pass = g_pass.serial; g_pso_dirty = !cur_ps; }
+    if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial || (pr->sh[1] && pr->sh[1]->border_seen) || (pr->sh[0] && pr->sh[0]->border_seen)) { cur_ps = pso_get(pr, nil); cur_pr = pr; cur_ps_pass = g_pass.serial; g_pso_dirty = !cur_ps; }
     if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_dirty = 1; }   // 下一次绘制重新按自身情况取 | The next draw fetches again according to its own situation
     __unsafe_unretained id<MTLRenderPipelineState> ps = cur_ps;
     if (!ps) { g_draw_skip[9]++; static int failed_n; if (failed_n++ < 3) MLOG("[pipeline-draw] rt-depth=%p serial=%llu fmt=%#x pass-depth=%u dt=%u dw=%u fs-depth=%d", R.rt.depth, (unsigned long long)(R.rt.depth ? R.rt.depth->serial : 0), R.rt.depth ? R.rt.depth->d.format : 0, g_pass.dfmt, S.ds.dt, S.ds.dw, pr->sh[1] ? pr->sh[1]->writes_depth : 0); return; }
@@ -9381,11 +9847,44 @@ frz_plain:;
     if (g_ui_rect_fn && dw && dw->count == 4 && S.nattr == 2 && S.stream[0].stride == 20) { double uy = 0, uh = 1; g_ui_rect_fn(&uy, &uh);
         if (uh > 0 && uh < 1) { if (ui_cover_all(uh)) vs = 1 / uh; else if (uy > 0) { so = lround(uy * th); if (ui_mat_ok()) moff = 2 * uy; else { vo = so; static int n; if (n++ < 4) MLOG("界面下移：投影矩阵这次读不到，退回挪视口（通道 %llu）", g_stat_pass); } } } }
     if (moff != g_ui_moff) { g_ui_moff = moff; args_dirty_stage(0); }
-    if (S.has_vp) enc_r_viewport(en, (MTLViewport){S.vp[0][0], S.vp[0][1] + vo, S.vp[0][2], S.vp[0][3] * vs, S.dr[0], S.dr[1]});
-    else enc_r_viewport(en, (MTLViewport){0, vo, tw, th * vs, 0, 1});
+    double ux = uw_ui_squeeze(pr && pr->sh[0] ? pr->sh[0]->key : NULL, dw, di, tw, th), cx = tw / 2.0;   // key 4: UI squeezed by 1 / ux about the canvas centre
+    double vx = S.has_vp ? S.vp[0][0] : 0, vw = S.has_vp ? S.vp[0][2] : tw;
+    if (ux != 1) { vx = cx + (vx - cx) / ux; vw /= ux; }
+    if ((atomic_load(&g_uw_log) > 0 && uw_on_canvas()) || atomic_load(&g_draw_log) > 0)
+        MLOG("[uw] F%llu pass %llu ui %d squeeze %.3f vs %.8s fs %.8s count %u inst %d vp %s%g,%g,%g,%g sc %s%d,%d,%d,%d blend %#x tex %ux%u fmt %#x ser %llu bl %u,%u,%u/%u,%u,%u cm %#x prim %d",
+             (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, g_uw_ui, ux, pr && pr->sh[0] ? pr->sh[0]->key : "-", pr && pr->sh[1] ? pr->sh[1]->key : "-",
+             dw ? dw->count : di ? di->count : 0, dw ? dw->instances : di ? di->instances : 0, S.has_vp ? "" : "none ", S.has_vp ? S.vp[0][0] : 0, S.has_vp ? S.vp[0][1] : 0, S.has_vp ? S.vp[0][2] : 0, S.has_vp ? S.vp[0][3] : 0,
+             R.has_sc ? "" : "none ", R.sc.x, R.sc.y, R.sc.w, R.sc.h, S.color.blend_en, (unsigned)tw, (unsigned)th,
+             R.rt.n > 0 && R.rt.color[0] ? R.rt.color[0]->d.format : 0, (unsigned long long)(R.rt.n > 0 && R.rt.color[0] ? R.rt.color[0]->serial : 0),
+             (unsigned)S.blend[0].src_rgb, (unsigned)S.blend[0].dst_rgb, (unsigned)S.blend[0].eq_rgb, (unsigned)S.blend[0].src_a, (unsigned)S.blend[0].dst_a, (unsigned)S.blend[0].eq_a,
+             S.chmask.mask, dw ? dw->prim : di ? di->prim : -1);
+    if (atomic_load(&g_draw_log) > 0 && pr && pr->sh[0]) {   // TOTK_DRAW_LOG_UBO=<vertex shader key prefix>:<cbuf reg>[:<stage>]: also log the first words of that uniform buffer and the fragment stage's texture 0 / sampler
+        static const char *spec; static int init; if (!init++) spec = getenv("TOTK_DRAW_LOG_UBO");
+        const char *colon = spec ? strchr(spec, ':') : NULL;
+        if (colon && !strncmp(pr->sh[0]->key, spec, (size_t)(colon - spec))) {
+            const char *c2 = strchr(colon + 1, ':'); int stage = c2 ? atoi(c2 + 1) : 0;   // optional third field: NVN stage (0 vertex, 1 fragment)
+            int reg = atoi(colon + 1); const p_bind_buf *u = reg >= 0 && reg < 16 && stage >= 0 && stage < 6 ? &S.ubo[stage][reg] : NULL;
+            if (u && u->addr && u->size >= 48) { const float *w = (const float *)(uintptr_t)u->addr;
+                MLOG("[uw] F%llu ubo %d.%d @%#llx: %g %g %g %g | %g %g %g %g | %g %g %g %g", (unsigned long long)atomic_load(&g_cur_frame), stage, reg, (unsigned long long)u->addr,
+                     w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11]); }
+            else if (u && u->addr && u->size >= 16) { const float *w = (const float *)(uintptr_t)u->addr;
+                MLOG("[uw] F%llu ubo %d.%d @%#llx size %llu: %g %g %g %g", (unsigned long long)atomic_load(&g_cur_frame), stage, reg, (unsigned long long)u->addr, (unsigned long long)u->size, w[0], w[1], w[2], w[3]); }
+            {   // the fragment stage's combined texture 0: its texture serial and sampler (wrap, filter, border)
+                uint64_t h = S.tex[1][0]; int tid = (int)(h & 0xfffff), sid = (int)(h >> 20);
+                samp_par sp = sid > 0 && sid < g_nsreg && g_sreg_ok[sid] ? g_sreg[sid] : (samp_par){0};
+                MLOG("[uw] F%llu fs tex0 ser %llu sampler %d wrap %u,%u,%u filter %u/%u border %g %g %g %g", (unsigned long long)atomic_load(&g_cur_frame),
+                     (unsigned long long)(tid > 0 && tid < g_ntreg ? g_treg[tid].t.serial : 0), sid, (unsigned)sp.ws, (unsigned)sp.wt, (unsigned)sp.wr, (unsigned)sp.magf, (unsigned)sp.minf,
+                     sp.border[0], sp.border[1], sp.border[2], sp.border[3]);
+            }
+        }
+    }
+    if (S.has_vp) enc_r_viewport(en, (MTLViewport){vx, S.vp[0][1] + vo, vw, S.vp[0][3] * vs, S.dr[0], S.dr[1]});
+    else enc_r_viewport(en, (MTLViewport){vx, vo, vw, th * vs, 0, 1});
     MTLScissorRect sc = {0, 0, tw, th};
     if (R.has_sc) {
-        long x0 = R.sc.x < 0 ? 0 : R.sc.x, y0 = R.sc.y <= 0 ? 0 : R.sc.y + so, x1 = (long)R.sc.x + R.sc.w, y1 = vs != 1 ? (long)th : (long)R.sc.y + R.sc.h + so;
+        long sx0 = R.sc.x, sx1 = (long)R.sc.x + R.sc.w;
+        if (ux != 1) { sx0 = lround(cx + (sx0 - cx) / ux); sx1 = lround(cx + (sx1 - cx) / ux); }
+        long x0 = sx0 < 0 ? 0 : sx0, y0 = R.sc.y <= 0 ? 0 : R.sc.y + so, x1 = sx1, y1 = vs != 1 ? (long)th : (long)R.sc.y + R.sc.h + so;
         if (x1 > (long)tw) x1 = tw; if (y1 > (long)th) y1 = th;
         if (x1 <= x0 || y1 <= y0) { g_draw_skip[10]++; return; }
         sc = (MTLScissorRect){(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0)};
@@ -9690,6 +10189,7 @@ static void dispatch(const p_dispatch *dp) {
     enc_c_pso(ce, ps);
     g_dispatch_grid[0] = (uint32_t)dp->x; g_dispatch_grid[1] = (uint32_t)dp->y; g_dispatch_grid[2] = (uint32_t)dp->z;
     encode_args(ce, cs, 5, 0);
+    if (atomic_load(&g_draw_log) > 0) MLOG("[uw] F%llu pass %llu dispatch cs %.8s grid %dx%dx%d", (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, cs->key, dp->x, dp->y, dp->z);
     enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(tg[0], tg[1], tg[2]));
     if (!reuse) enc_c_end(ce);
     bright_lut(cs);   // 3D 画面加亮：游戏算完调色表之后重写 | 3D picture brightening: rewrite after the game finishes computing the color lookup table
@@ -9711,6 +10211,9 @@ static void dispatch(const p_dispatch *dp) {
 // GPU: texture -> buffer (row stride taken from SetCopyRowStride, 0 = tightly packed)
 static void copy_t2b(const p_copy_b2t *c) {
     if (c->tex) xv_check(c->tex->serial, c->has_view && c->view.set_levels ? c->view.base_level : 0, c->has_view && c->view.set_layers ? c->view.min_layer : 0, "贴图读缓冲");
+    if (atomic_load(&g_draw_log) > 0 && c->tex)
+        MLOG("[uw] F%llu pass %llu copy t2b ser %llu %ux%u fmt %#x region %d,%d %dx%d -> %#llx", (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, (unsigned long long)c->tex->serial,
+             c->tex->d.width, c->tex->d.height, c->tex->d.format, c->r.xoffset, c->r.yoffset, c->r.width, c->r.height, (unsigned long long)c->src);
     id<MTLTexture> t = tex_mtl(c->tex);
     if (!t) return;
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
@@ -9953,6 +10456,9 @@ static void copy_t2t(const p_copy_t2t *c) {
 // view with changed format: clear on a view of that format; partial region, partial channels, compressed / packaged textures (no render target usage): report a failure, to be implemented
 static void clear_tex(const p_clear_tex *c) {
     if (c->tex) zskip_del(c->tex->serial);
+    if (atomic_load(&g_draw_log) > 0 && c->tex)
+        MLOG("[uw] F%llu pass %llu clear tex ser %llu %ux%u fmt %#x region %d,%d %dx%d mask %#x %g %g %g %g", (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, (unsigned long long)c->tex->serial,
+             c->tex->d.width, c->tex->d.height, c->tex->d.format, c->r.xoffset, c->r.yoffset, c->r.width, c->r.height, c->mask, c->c.f[0], c->c.f[1], c->c.f[2], c->c.f[3]);
     id<MTLTexture> t = tex_mtl(c->tex);
     PD("X ser=%llu 视图格式 %#x 区域 %d,%d,%d %dx%dx%d 掩码 %#x %s %g,%g,%g,%g", c->tex->serial, c->has_view && c->view.set_format ? c->view.format : -1, c->r.xoffset, c->r.yoffset, c->r.zoffset, c->r.width, c->r.height, c->r.depth, c->mask,
        c->is_uint ? "ui" : "f", c->is_uint ? (double)c->c.u[0] : c->c.f[0], c->is_uint ? (double)c->c.u[1] : c->c.f[1], c->is_uint ? (double)c->c.u[2] : c->c.f[2], c->is_uint ? (double)c->c.u[3] : c->c.f[3]);
@@ -10288,6 +10794,10 @@ void mtl_exec(const uint8_t *p) {
             }
             case OP_CLEAR_COLOR: {
                 const p_clear_color *c = a;
+                if (atomic_load(&g_draw_log) > 0 && c->index >= 0 && c->index < R.rt.n && R.rt.color[c->index])
+                    MLOG("[uw] F%llu pass %llu clear c%d ser %llu %ux%u fmt %#x mask %#x rgba %g %g %g %g%s", (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, c->index,
+                         (unsigned long long)R.rt.color[c->index]->serial, R.rt.color[c->index]->d.width, R.rt.color[c->index]->d.height, R.rt.color[c->index]->d.format, c->mask,
+                         c->rgba[0], c->rgba[1], c->rgba[2], c->rgba[3], S.render_disabled ? " (rendering disabled)" : "");
                 if (S.render_disabled) { g_draw_skip[12]++; PD("E clear c%d skipped: rendering disabled", c->index); break; }   // TOTK: SetRenderEnable(false) / conditional
                 if (g_rt_merged) rp_end();   // 续用的通道里来了清除：在此结束，清除照旧挂到下一个通道开头 | A clear arrived in a continued render pass: end it here, and the clear is attached to the start of the next render pass as usual
                 if (c->index < 0 || c->index >= R.rt.n || !R.rt.color[c->index]) { RED_ONCE(5, "清色目标 %d 无效", c->index); break; }
@@ -10933,6 +11443,13 @@ static void outup_note_gpu(int slot) {   // the present command buffer of this s
              (unsigned long long)g_outup_n, a[256], a[486], (unsigned long long)g_outup_skip[0], (unsigned long long)g_outup_skip[1], (unsigned long long)g_outup_skip[2]);
     }
 }
+// TOTK_STRETCH=1, or the ultrawide ratio of key 4 / TOTK_ASPECT: fill the window whatever its shape, like an emulator's "Stretch to Window" (aspect-ratio mods such as
+// TOTK-Ultrawide draw a horizontally squeezed picture for it). Off: the game picture keeps its shape, centred.
+static int present_stretch(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_STRETCH"); on = e && !strcmp(e, "1"); }
+    return on || (runtime_aspect_now && runtime_aspect_now() > 0);   // key 4 / TOTK_ASPECT: runtime/aspect_patch.h
+}
 static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4], int fps_overlay) {
     NSUInteger cx = 0, cy = 0, cw = src.width, ch = src.height;
     if (crop && (crop[2] || crop[3])) {
@@ -10954,7 +11471,7 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
     // when the ratio difference is < 1% (the remainder from the game width being a multiple of 8 in the full-screen setup, e.g. 1952x900 versus 2868x1320 differs by 0.17%) fill directly, leaving no few-pixel border
     double dw = dst.width, dh = dst.height, s = fmin(dw / cw, dh / ch);
     MTLViewport vp = {floor((dw - cw * s) / 2), floor((dh - ch * s) / 2), round(cw * s), round(ch * s), 0, 1};
-    if (fabs((dw / dh) / ((double)cw / ch) - 1) < 0.01) vp = (MTLViewport){0, 0, dw, dh, 0, 1};
+    if (fabs((dw / dh) / ((double)cw / ch) - 1) < 0.01 || present_stretch()) vp = (MTLViewport){0, 0, dw, dh, 0, 1};
     int full = vp.originX == 0 && vp.originY == 0 && vp.width == dw && vp.height == dh;
     static double last_vp[4];   // 视口变化时记一行（真机屏幕级验收 screen_check.py 核宽高比用） | Log one line when the viewport changes (used by the real-device screen-level acceptance screen_check.py to check the aspect ratio)
     if (memcmp(last_vp, &vp, sizeof last_vp)) { memcpy(last_vp, &vp, sizeof last_vp);
@@ -10998,7 +11515,7 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
     present_pipeline(dst.pixelFormat);
     double dw = dst.width, dh = dst.height, s = fmin(dw / cw, dh / ch);
     MTLViewport vp = {floor((dw - cw * s) / 2), floor((dh - ch * s) / 2), round(cw * s), round(ch * s), 0, 1};
-    if (fabs((dw / dh) / ((double)cw / ch) - 1) < 0.01) vp = (MTLViewport){0, 0, dw, dh, 0, 1};
+    if (fabs((dw / dh) / ((double)cw / ch) - 1) < 0.01 || present_stretch()) vp = (MTLViewport){0, 0, dw, dh, 0, 1};
     int full = vp.originX == 0 && vp.originY == 0 && vp.width == dw && vp.height == dh;
     id<MTLTexture> up = output_upscale(cb, src, cx, cy, cw, ch, vp, uv_i);   // TOTK 2K output: MetalFX to the viewport, drawn 1:1 below
     id<MTLTexture> pic = up ? up : src;
@@ -11763,11 +12280,7 @@ void mtl_present_discard(int on) { atomic_store(&g_present_discard, on != 0); if
 static id<MTL4CommandAllocator> g_mfx_alloc[3]; static id<MTL4CommandBuffer> g_mfx_cb[3]; static _Atomic int g_mfx_busy[3];
 static id<MTLTexture> g_mfx_swap_prev;   // TOTK_MFX_DUMP: copy of the previous presented image
 static int mfx_present_frame_body(const tex_t *t, double period, int discard) {
-    if (t) {
-        int known = 0; for (int i = 0; i < g_mfx.nswap; i++) known |= g_mfx.swap[i] == t->serial;
-        if (!known) g_mfx.swap[g_mfx.nswap < 4 ? g_mfx.nswap++ : (int)(t->serial % 4)] = t->serial;
-        g_mfx.swap_w = t->d.width; g_mfx.swap_h = t->d.height;
-    }
+    if (t) uw_note_present(t);
     int slot = mfx_frame_prepare(period);
     if (slot >= 0) {
         int a = -1; for (int i = 0; i < 3 && a < 0; i++) if (!atomic_load(&g_mfx_busy[i])) a = i;
@@ -11826,6 +12339,11 @@ static int mfx_present_frame(const tex_t *t, double period, int discard) {
 uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     int discard = atomic_load(&g_present_discard), islot = mfx_enabled() && t ? mfx_present_frame(t, period, discard) : -1;
     if (mfx_latch() && !mfx_enabled()) g_mfx.scene_done = g_mfx.ui_cleared = g_mfx.depth_done = g_mfx.want_cam = 0;   // key 2 / flag mfx_interp: the next frame is fully on or off
+    if (t && !mfx_enabled() && uw_ratio()) uw_note_present(t);   // key 4: the canvas search (TOTK_MFX does it in mfx_present_frame)
+    mtl_wb_eager();
+    g_uw_ui = 0;
+    if (atomic_load(&g_uw_log) > 0) atomic_fetch_sub(&g_uw_log, 1);
+    if (atomic_load(&g_draw_log) > 0) atomic_fetch_sub(&g_draw_log, 1);
     if (discard) return 0;   // 票号 0 = 没有待完成的上屏，取交换链贴图处不等 | Ticket number 0 = no pending present; the swapchain texture acquire does not wait
     if (t) { xv_check(t->serial, 0, 0, "出图"); if (g_xv_npresent < 128) g_xv_present[g_xv_npresent++] = t->serial; }
     static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, present_start);
@@ -11887,6 +12405,15 @@ void mtl_args_stats(uint64_t *enc, uint64_t *reuse) { *enc = g_stat_args_enc; *r
     if (frame && !(frame % 300) && frame != logged) { logged = frame;
         MLOG("[drv-cache] hit=%llu miss=%llu verified=%llu", (unsigned long long)g_driver_hit, (unsigned long long)g_driver_miss, (unsigned long long)g_driver_check);
         MLOG("[texture-plan] enabled=%d total=%llu selected=%llu verified=%llu", texture_plan_on(), (unsigned long long)g_texture_plan_total, (unsigned long long)g_texture_plan_selected, (unsigned long long)g_texture_plan_verified);
+        if (!(frame % 3000)) {
+            pthread_mutex_lock(&g_smu);
+            uint64_t bytes = g_dead_serial.bytes + g_gpu_owned.bytes, pages = g_dead_serial.pages + g_gpu_owned.pages;
+            uint64_t dead = g_dead_serial.n, owned = g_gpu_owned.n;
+            pthread_mutex_unlock(&g_smu);
+            MLOG("[serial-history] frame=%llu dead=%llu owned=%llu pages=%llu bytes=%llu",
+                (unsigned long long)frame, (unsigned long long)dead, (unsigned long long)owned,
+                (unsigned long long)pages, (unsigned long long)bytes);
+        }
     }
 }
 void mtl_use_stats(uint64_t *call, uint64_t *skip) { *call = 0; *skip = 0; }
@@ -12035,8 +12562,8 @@ int mtl_probe_depth_output(void) {
     mtl_init();
     NSString *vsrc = @"#include <metal_stdlib>\nusing namespace metal;\nstruct V { float4 p [[position]]; };\nvertex V vs(uint id [[vertex_id]]) { float2 p[3]={float2(-1,-1),float2(3,-1),float2(-1,3)}; return {float4(p[id],0.75,1)}; }";
     NSString *fsrc = @"#include <metal_stdlib>\nusing namespace metal;\nstruct main0_out { float4 color [[color(0)]]; float gl_FragDepth [[depth(any)]]; };\nfragment main0_out main0() { main0_out out = {}; out.gl_FragDepth=0.125; out.color=float4(out.gl_FragDepth*2,0.5,0.75,1); return out; }";
-    NSError *err = nil; id<MTLLibrary> vl = [g_dev newLibraryWithSource:vsrc options:totk_precise_opts() error:&err];
-    id<MTLLibrary> fl = [g_dev newLibraryWithSource:fsrc options:totk_precise_opts() error:&err];
+    NSError *err = nil; id<MTLLibrary> vl = totk_msl_library(vsrc, &err);
+    id<MTLLibrary> fl = totk_msl_library(fsrc, &err);
     if (!vl || !fl) MDIE("depth output probe compile: %s", err.localizedDescription.UTF8String);
     NvShader *vs = [NvShader new], *fs = [NvShader new]; vs->fn = [vl newFunctionWithName:@"vs"]; vs->io = @{};
     fs->fn = [fl newFunctionWithName:@"main0"]; fs->src = fsrc; fs->io = @{}; fs->writes_depth = 1; strcpy(fs->key, "probe-depth-output");
@@ -12964,7 +13491,7 @@ int mtl_probe_dispatch_chain(void) {
     NvProg *pr[2]; prog_t pg[2] = {{0}, {0}};
     for (int k = 0; k < 2; k++) {
         NSError *e = nil; NSString *msl = [NSString stringWithFormat:@"%s%s", head, body[k]];
-        id<MTLLibrary> lib = [g_dev newLibraryWithSource:msl options:totk_precise_opts() error:&e];
+        id<MTLLibrary> lib = totk_msl_library(msl, &e);
         if (!lib) MDIE("dispatch-chain probe: kernel %d does not compile: %s", k, e.localizedDescription.UTF8String);
         NvShader *cs = [NvShader new]; cs->fn = [lib newFunctionWithName:@"main0"]; cs->stage = 5; cs->src = msl;
         snprintf(cs->key, sizeof cs->key, "probe-dispatch-chain-%d", k);
@@ -13041,7 +13568,7 @@ int mtl_probe_layer_merge(void) {
         "    out.m_0 = float4(float(k + 1u) / 64.0, 0.25, 0.5, 1.0);\n    if (k >= 64u)\n    {\n        return out;\n    }\n    return out;\n}\n";
     NSString *fsrc = @"#include <metal_stdlib>\nusing namespace metal;\n\nstruct main0_out\n{\n    float4 c [[color(0)]];\n};\n\nstruct main0_in\n{\n    float4 m_0 [[user(locn0)]];\n};\n\n"
         "fragment main0_out main0(main0_in in [[stage_in]])\n{\n    main0_out out = {};\n    out.c = in.m_0;\n    return out;\n}\n";
-    NSError *e = nil; id<MTLLibrary> vl = [g_dev newLibraryWithSource:vsrc options:totk_precise_opts() error:&e], fl = vl ? [g_dev newLibraryWithSource:fsrc options:totk_precise_opts() error:&e] : nil;
+    NSError *e = nil; id<MTLLibrary> vl = totk_msl_library(vsrc, &e), fl = vl ? totk_msl_library(fsrc, &e) : nil;
     if (!vl || !fl) MDIE("layer probe shaders: %s", e.localizedDescription.UTF8String);
     NvShader *vs = [NvShader new], *vs_plain = [NvShader new], *fs = [NvShader new];
     vs->fn = vs_plain->fn = [vl newFunctionWithName:@"main0"]; vs->src = vsrc; strcpy(vs->key, "probe-layer-vs"); strcpy(vs_plain->key, "probe-layer-vs-without-msl");
@@ -13305,6 +13832,7 @@ int mtl_probe_arg_epoch(void) {
 }
 
 #include "nvn_tex_slots_probe.h"
+#include "nvn_copy_alias_probe.h"
 
 #include "nvn_pool_retire_probe.h"
 #include "nvn_cube_group_probe.h"

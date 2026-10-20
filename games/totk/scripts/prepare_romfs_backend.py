@@ -12,7 +12,7 @@ def runtime_index(files):
 
 if __name__=='__main__':
     root=Path(__file__).resolve().parents[1]
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--version', choices=('v0','v112','v143','v190'), default='v0');version=parser.parse_args().version
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--version', choices=('v0','v112','v121','v143','v190'), default='v0');version=parser.parse_args().version
     out=root/('build' if version=='v0' else f'build/{version}');out.mkdir(parents=True,exist_ok=True)
     folder=root/f'extracted/{version}/romfs';manifest=json.loads((folder/'index.json').read_text())
     assert manifest['status']=='pass' and (folder/'romfs.bin').stat().st_size==manifest['romfs_size']

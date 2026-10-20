@@ -142,6 +142,10 @@ static void patch_output_res(Module *m) {
 }
 uint64_t runtime_output_res_extra_bytes(void) { return 0; }
 int runtime_output_res_toggle(void) { return 0; }
+uint64_t runtime_output_size_current(void) { return out_w ? (uint64_t)out_h << 32 | out_w : (uint64_t)1080 << 32 | 1920; }
+/* Key 4 (TOTK's ultrawide, aspect_patch.h): its sites are TOTK's, so BOTW keeps 16:9. */
+int runtime_aspect_toggle(void) { return 0; }
+float runtime_aspect_now(void) { return 0; }
 /* Key 3: MetalFX upscaling of the finished picture to the window (full screen or a large window shows the 1920x1080
    picture bigger; MetalFX instead of the bilinear stretch). The host's output stage (nvn_mtl.m output_upscale) is
    game-independent; TOTK's other stage (its own upscale shader replaced by MetalFX) does not apply to BOTW. The scene

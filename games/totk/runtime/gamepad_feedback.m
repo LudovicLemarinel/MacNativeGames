@@ -363,7 +363,7 @@ static void hid_motion_start(const char *why) {   /* main queue */
     }
     hidMotion = YES; hidLast = 0; hidUserCalibration = NO;
     motionPad.motion.valueChangedHandler = nil;   /* sensors stay active: GameController keeps the IMU reporting */
-    runtime_motion_live(1);
+    runtime_motion_deadzone_default(1.2); runtime_motion_live(1);
     fprintf(stderr, "[gyro] %s: %s; reading the six-axis sensor from its HID reports\n", name, why);
     /* IMU on, then the calibrations; spaced out, as the controller drops subcommands sent back to back */
     static const uint8_t imuOn[1] = {0x01}, factory[5] = {0x20, 0x60, 0, 0, 24}, user[5] = {0x26, 0x80, 0, 0, 26};
@@ -373,7 +373,7 @@ static void hid_motion_start(const char *why) {   /* main queue */
 }
 static void hid_motion_stop(void) {   /* main queue */
     if (!hidMotion) return;
-    hidMotion = NO; hid_close_unused();
+    hidMotion = NO; hid_close_unused(); runtime_motion_deadzone_default(0);
 }
 static BOOL hid_rumble_start(GCController *c) {   /* main queue, rumbleQueue made */
     const char *name = (c.vendorName ?: @"controller").UTF8String;
@@ -422,7 +422,7 @@ void runtime_feedback_attach(GCController *c) {   /* main queue */
         GCMotion *m = c.motion;
         if (!m || !m.hasRotationRate) { fprintf(stderr, "[gyro] %s has no gyro: no motion from it\n", name); return; }
         if (m.sensorsRequireManualActivation) m.sensorsActive = YES;
-        hid_motion_stop(); zeroSince = 0; motionSeen = hidAsked = NO;
+        hid_motion_stop(); zeroSince = 0; motionSeen = hidAsked = NO; runtime_motion_deadzone_default(0);
         m.valueChangedHandler = ^(GCMotion *changed) { motion_sample(changed); };
         motionPad = c; runtime_motion_live(1);
         fprintf(stderr, "[gyro] %s: motion sensors on (gyro%s)\n", name, m.hasGravityAndUserAcceleration ? ", gravity" : ", acceleration");
