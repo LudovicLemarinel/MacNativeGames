@@ -2487,6 +2487,7 @@ static void sleep_until_ns(uint64_t dl) {   // 单调时钟上的绝对时刻 | 
 // DM_PRESENT_HZ=0 (uncapped frame rate) serves only as an explicit performance profiling switch: some of the game's UI logic counts frames (with the same save, uncapped gives
 // 4181 SaveIndicatorPanel entries and capped at 60 fps gives 0, which matches the ground truth), so uncapped is a semantically wrong way to run and must not be used as a criterion / cross-check / default. Unit tests set it directly with nvn_present_config
 static int g_hz = -1, g_display_mode;
+static int g_cfg_scr = -1;   // the display rate present_cfg chose for (-1: set by nvn_present_config, kept)
 /* TOTK_UNCAPPED (Mac and iPhone, default on; =0 off): like vsync off in other games. The game no longer waits for the display: it is
    paced by our own clock at UNCAPPED_HZ, and the display link shows the newest finished frame at every refresh (older ones
    are merged away, as when the game runs ahead). The ceiling is 120 because the real-time frame step (game_patches.c)
@@ -2501,7 +2502,7 @@ static int uncapped_cap(int scr) {
     int v = !e ? UNCAPPED_HZ : !strcmp(e, "display") ? (scr > 0 ? scr : 60) : atoi(e);
     return v < 30 ? 30 : v > UNCAPPED_HZ ? UNCAPPED_HZ : v;
 }
-void nvn_present_config(int hz, int display_mode) { g_hz = g_paced_hz = hz; g_display_mode = display_mode; }
+void nvn_present_config(int hz, int display_mode) { g_hz = g_paced_hz = hz; g_display_mode = display_mode; g_cfg_scr = -1; }
 /* The game patches say whether game time follows real time (TOTK's real-time frame step). 0: the game advances a fixed
    step per frame (BOTW, unpatched), so it must be paced as on the console: 60 Hz ticks and the game's own interval;
    uncapped or display-rate pacing would run it fast. The weak default (-1) keeps TOTK_REALTIME in charge. */
@@ -2511,10 +2512,12 @@ __attribute__((weak)) int runtime_frame_max_hz(void) { return 0; }   /* the game
    nvnQueuePresentTexture counts draws only once it is not 0. */
 __attribute__((weak)) int runtime_world_loading(void) { return -1; }
 static void present_cfg(const win_t *o) {
-    if (g_hz >= 0) return;
+    /* again when the window moved to a display with another refresh rate (mtl_display_hz follows the window) */
+    if (g_hz >= 0 && (g_cfg_scr < 0 || mtl_display_hz() == g_cfg_scr)) return;
+    if (g_hz >= 0) LOG("[nvn] 显示器刷新率变了（%d -> %d Hz）：重新设出图节拍 | the window's display changed refresh rate: pacing set again", g_cfg_scr, mtl_display_hz());
     // 有窗口仍缺省 display 间隔模式；无窗口缺省 game 模式。环境变量可覆盖固定 60 Hz。
     // With a window the default is still display interval mode; without a window the default is game mode. Environment variables can override the fixed 60 Hz.
-    int scr = mtl_display_hz();
+    int scr = mtl_display_hz(); g_cfg_scr = scr;
     const char *e = getenv("DM_PRESENT_HZ"), *rt = getenv("TOTK_REALTIME");
     int realtime = !(rt && !strcmp(rt, "0")) && runtime_frame_step_realtime() != 0;
     g_hz = g_paced_hz = e ? atoi(e) : (realtime && scr > 0 ? scr : 60);
